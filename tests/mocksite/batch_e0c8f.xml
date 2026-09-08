@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<batch lotHash="e0c8f" auction="flexit-auctions-26-02-2026-1087">
+  <lot>
+    <title>12x Lenovo 8th-10th Gen Laptop Mix</title>
+    <currency>EUR</currency>
+    <items>
+      <item nr="1"><model>ThinkPad T480</model><cpu>i5-8250U</cpu><ram>8 GB</ram><serial>PF1A2B3C</serial><grade>B</grade></item>
+      <item nr="2"><model>ThinkPad T490</model><cpu>i7-8565U</cpu><ram>16 GB</ram><serial>PF4D5E6F</serial><grade>A</grade></item>
+      <item nr="3"><model>ThinkPad L390</model><cpu>i3-8145U</cpu><ram>4 GB</ram><serial>PF7G8H9I</serial><grade>C</grade></item>
+    </items>
+  </lot>
+</batch>

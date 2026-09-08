@@ -1,0 +1,72 @@
+{
+  "_opis": [
+    "Mapa tras atrapy portalu flexitauctions.com uzywanej w tests/test_scrape.py.",
+    "Klucz = doslowny cel zadania HTTP (sciezka wraz z ewentualnym '?query').",
+    "Pola: file (plik w tym katalogu), content_type, status, location,",
+    "delay (sekundy, wolna odpowiedz), fail_times (ile pierwszych zadan ma sie",
+    "wywalic; -1 = zawsze), fail_status, retry_after, headers (dodatkowe naglowki)."
+  ],
+
+  "/": {"file": "list_page1.html"},
+  "/?page=1": {"file": "list_page1.html"},
+  "/?page=2": {"file": "list_page2.html"},
+  "/?page=3": {"file": "list_page3.html"},
+  "/?order=closedSoonest": {"file": "list_page1.html"},
+  "/pusto": {"file": "empty_list.html"},
+
+  "/auction/flexit-auctions-26-02-2026-1087": {"file": "auction_1087.html"},
+  "/auction/flexit-auctions-26-02-2026-1087/info": {"file": "auction_1087.html"},
+  "/auction/flexit-auctions-18-06-2026-1103": {"file": "auction_1103.html"},
+  "/auction/flexit-auctions-18-06-2026-1103/info": {"file": "auction_1103.html"},
+  "/auction/flexit-auctions-02-01-2026-1023": {"file": "auction_pusta.html"},
+  "/auction/flexit-auctions-02-01-2026-1023/info": {"file": "auction_pusta.html"},
+  "/auction/flexit-auctions-15-03-2025-1037": {"file": "auction_pusta.html"},
+  "/auction/flexit-auctions-30-11-2025-1011": {"file": "auction_pusta.html"},
+
+  "/lot/lenovo-8th-10th-gen-laptop-mix-e0c8f": {"file": "lot_e0c8f.html"},
+  "/auction/flexit-auctions-26-02-2026-1087/lenovo-8th-10th-gen-laptop-mix-e0c8f": {"file": "lot_e0c8f.html"},
+  "/auction/flexit-auctions-26-02-2026-1087/dell-optiplex-mix-cd048": {"file": "lot_cd048.html"},
+  "/lot/dell-optiplex-mix-cd048": {"file": "lot_cd048.html"},
+  "/lot/hp-elitedesk-mix-53439": {"file": "lot_53439.html"},
+  "/lot/apple-imac-mix-2a98f": {"file": "lot_2a98f.html"},
+  "/lot/mieszany-zwrot-11588": {"file": "lot_11588.html"},
+  "/lot/pusty-lot-6bfb2": {"file": "lot_6bfb2.html"},
+  "/lot/thinkpad-t480-mix-bcd12": {"file": "lot_bcd12.html"},
+
+  "/media/batch-1087-e0c8f.xml": {"file": "batch_e0c8f.xml", "content_type": "application/xml"},
+  "/api/lot/cd048/batch?format=xml": {"file": "batch_cd048.xml", "content_type": "text/xml; charset=utf-8"},
+  "/dl/53439": {
+    "file": "batch_53439.xml",
+    "content_type": "application/octet-stream",
+    "headers": {"Content-Disposition": "attachment; filename=\"../../etc/passwd\""}
+  },
+  "/download/batch-2a98f": {"file": "batch_2a98f.xml", "content_type": "application/xml"},
+  "/media/download?file=../../../../etc/passwd&format=xml": {
+    "file": "batch_11588.xml", "content_type": "application/xml"
+  },
+  "/media/batch-1103-all.xml": {"file": "batch_1103_all.xml", "content_type": "application/xml"},
+  "/media/batch-1103-bcd12.xml": {"file": "batch_1103_bcd12.xml", "content_type": "application/xml"},
+
+  "/dl/other": {"file": "not_xml.html", "content_type": "text/html; charset=utf-8"},
+  "/assets/lot.css": {"file": "style.css", "content_type": "text/css"},
+  "/login.xml": {"file": "login.html", "content_type": "text/html; charset=utf-8"},
+  "/empty.xml": {"file": "empty.xml", "content_type": "application/xml"},
+
+  "/flaky/batch.xml": {
+    "file": "batch_flaky.xml", "content_type": "application/xml",
+    "fail_times": 2, "fail_status": 503
+  },
+  "/flaky-forever.xml": {
+    "file": "batch_flaky.xml", "content_type": "application/xml",
+    "fail_times": -1, "fail_status": 503
+  },
+  "/retry-after.xml": {
+    "file": "batch_flaky.xml", "content_type": "application/xml",
+    "fail_times": 1, "fail_status": 503, "retry_after": "1"
+  },
+  "/teapot.xml": {"file": "batch_flaky.xml", "fail_times": -1, "fail_status": 418},
+  "/slow.xml": {"file": "batch_flaky.xml", "content_type": "application/xml", "delay": 0.4},
+
+  "/redirect-in": {"status": 302, "location": "/media/batch-1087-e0c8f.xml"},
+  "/redirect-out": {"status": 302, "location": "https://evil.example.com/batch.xml"}
+}

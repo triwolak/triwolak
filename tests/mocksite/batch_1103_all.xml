@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<batch auction="flexit-auctions-18-06-2026-1103">
+  <lot>
+    <title>Whole auction export</title>
+    <items>
+      <item nr="1"><model>ThinkPad T480</model><serial>WA0001</serial><grade>A</grade></item>
+    </items>
+  </lot>
+</batch>

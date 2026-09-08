@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<batch lotHash="53439" auction="flexit-auctions-26-02-2026-1087">
+  <lot>
+    <title>10x HP EliteDesk Mix</title>
+    <items>
+      <item nr="1"><model>EliteDesk 800 G4</model><ram>8 GB</ram><serial>HP0001</serial><grade>B</grade></item>
+    </items>
+  </lot>
+</batch>

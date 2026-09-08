@@ -1,0 +1,62 @@
+# --- Python ---------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# --- Środowiska wirtualne -------------------------------------------------
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# --- Testy i narzędzia ----------------------------------------------------
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+nosetests.xml
+
+# --- Dane robocze narzędzia ----------------------------------------------
+# Pobrane pliki XML i gotowe arkusze to WYNIKI pracy, nie kod źródłowy.
+xml_flexit/
+*.xlsx
+*.part
+.flexit2xlsx-*.tmp
+
+# Wyjątek: gdyby kiedyś powstały fixtury XLSX na potrzeby testów,
+# mają trafiać do repozytorium.
+!tests/fixtures/*.xlsx
+
+# --- Edytory i systemy operacyjne ----------------------------------------
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini

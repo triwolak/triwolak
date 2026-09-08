@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<batch lotHash="cd048" auction="flexit-auctions-26-02-2026-1087">
+  <lot>
+    <title>20x Dell OptiPlex Mix</title>
+    <items>
+      <item nr="1"><model>OptiPlex 3060</model><cpu>i5-8500T</cpu><ram>8 GB</ram><serial>DL0001</serial><grade>B</grade></item>
+      <item nr="2"><model>OptiPlex 5070</model><cpu>i5-9500</cpu><ram>16 GB</ram><serial>DL0002</serial><grade>A</grade></item>
+    </items>
+  </lot>
+</batch>

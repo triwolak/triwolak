@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Online Auctions &mdash; Flexit Auctions (mock)</title>
+  <link rel="stylesheet" href="/assets/lot.css">
+  <link rel="next" href="/?page=2">
+</head>
+<body>
+  <header><a href="/">Flexit Auctions</a></header>
+
+  <nav class="filters">
+    <a href="/?order=closedSoonest">Closing soonest</a>
+    <a href="/?custom-category=(Mobile)Workstations">Workstations</a>
+    <a href="/about">About us</a>
+    <a href="mailto:info@example.com">Contact</a>
+    <a href="javascript:void(0)">Filters</a>
+  </nav>
+
+  <ul class="auction-list">
+    <li>
+      <a href="/auction/flexit-auctions-26-02-2026-1087/info">
+        <img src="/img/1087.jpg" alt="">
+        Flexit Auctions 26-02-2026 (Krakow)
+      </a>
+    </li>
+    <li>
+      <!-- ten sam obiekt pod kanonicznym adresem: duplikat do deduplikacji -->
+      <a href="/auction/flexit-auctions-26-02-2026-1087">Flexit Auctions 26-02-2026</a>
+    </li>
+    <li>
+      <a href="/auction/flexit-auctions-18-06-2026-1103">Flexit Auctions 18-06-2026</a>
+    </li>
+    <li>
+      <!-- obca domena: NIE wolno tego pobierać -->
+      <a href="https://evil.example.com/auction/hacked-999/info">Flexit Auctions (mirror)</a>
+    </li>
+    <li>
+      <!-- pojedynczy lot na liscie: to nie jest aukcja -->
+      <a href="/lot/hp-elitedesk-mix-53439">10x HP EliteDesk Mix</a>
+    </li>
+  </ul>
+
+  <div class="pager">
+    <span class="current">1</span>
+    <a href="?page=2" rel="next">2</a>
+    <a href="?page=3">3</a>
+  </div>
+</body>
+</html>

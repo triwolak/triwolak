@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<batch lotHash="2a98f" auction="flexit-auctions-26-02-2026-1087">
+  <lot>
+    <title>5x Apple iMac Mix</title>
+    <items>
+      <item nr="1"><model>iMac 21.5 2017</model><ram>8 GB</ram><serial>AP0001</serial><grade>B</grade></item>
+      <item nr="2"><model>iMac 27 2015</model><ram>16 GB</ram><serial>AP0002</serial><grade>C</grade></item>
+    </items>
+  </lot>
+</batch>

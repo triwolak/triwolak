@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<batch lotHash="bcd12" auction="flexit-auctions-18-06-2026-1103">
+  <lot>
+    <title>15x ThinkPad T480 Mix</title>
+    <items>
+      <item nr="1"><model>ThinkPad T480</model><serial>TP0001</serial><grade>B</grade></item>
+    </items>
+  </lot>
+</batch>
