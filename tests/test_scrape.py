@@ -18,15 +18,18 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import gzip
 import io
 import json
 import os
 import shutil
+import socket
 import sys
 import tempfile
 import threading
 import time
 import unittest
+import zlib
 import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -279,7 +282,9 @@ class TestSafeFilename(unittest.TestCase):
         (None, "plik.xml"),
         ("   ", "plik.xml"),
         (".ukryty", "ukryty.xml"),
-        ("plik z polskimi znakami ąęć.xml", "plik_z_polskimi_znakami_.xml"),
+        # litery spoza ASCII są TRANSLITEROWANE, a nie kasowane — nazwa
+        # dalej identyfikuje plik (dawniej zostawało samo "xml.xml")
+        ("plik z polskimi znakami ąęć.xml", "plik_z_polskimi_znakami_aec.xml"),
         ("a/b/c/d.xml", "d.xml"),
         ("plik\x00.xml", "plik.xml"),
         ("plik\n\r\t.xml", "plik.xml"),
@@ -668,11 +673,24 @@ class TestFindXmlLinks(SiteTestCase):
         self.refs_1087(opener=opener)
         self.assertEqual(SITE.state.count("/dl/other"), 1)
 
-    def test_descend_auto_stops_when_auction_page_has_xml(self):
+    def test_descend_auto_schodzi_do_lotow_mimo_xml_na_stronie_aukcji(self):
+        """REGRESJA: zbiorczy XML aukcji nie może ukryć pakietów lotów.
+
+        Strona aukcji 1103 ma własny plik "całej aukcji" ORAZ listę lotów.
+        Dawniej ``--descend auto`` po znalezieniu tego jednego pliku nie schodził
+        już do żadnego lotu — cały pakiet "15x ThinkPad T480 Mix" znikał
+        z arkusza bez ostrzeżenia i z kodem wyjścia 0.
+        """
         opener = self.opener()
-        refs = find_xml_links(opener, self.auction(AUCTION_1103))
-        self.assertEqual([r.url for r in refs], [SITE.url("/media/batch-1103-all.xml")])
-        self.assertEqual(SITE.state.count("/lot/thinkpad-t480-mix-bcd12"), 0)
+        with capture_stderr() as err:
+            refs = find_xml_links(opener, self.auction(AUCTION_1103))
+        self.assertEqual(
+            sorted(r.url for r in refs),
+            sorted([SITE.url("/media/batch-1103-all.xml"),
+                    SITE.url("/media/batch-1103-bcd12.xml")]),
+        )
+        self.assertEqual(SITE.state.count("/lot/thinkpad-t480-mix-bcd12"), 1)
+        self.assertIn("schodzę też do lotów", err.getvalue())
 
     def test_descend_always_visits_lots(self):
         opener = self.opener()
@@ -947,8 +965,10 @@ class TestEndToEnd(SiteTestCase):
             for auction in auctions:
                 for ref in find_xml_links(opener, auction):
                     paths.append(download_xml(opener, ref, self.tmp))
-        self.assertEqual(len(paths), 6)
-        self.assertEqual(len(set(paths)), 6)
+        # 7, a nie 6: aukcja 1103 ma zbiorczy XML *oraz* pakiet lotu bcd12,
+        # do którego "auto" teraz schodzi
+        self.assertEqual(len(paths), 7)
+        self.assertEqual(len(set(paths)), 7)
         self.assertEqual(sorted(os.listdir(self.tmp)),
                          sorted(os.path.basename(p) for p in paths))
         for path in paths:
@@ -1029,8 +1049,9 @@ class TestModuleContract(unittest.TestCase):
     """Sygnatury z INTERFACES.md i zakaz zależności zewnętrznych."""
 
     STDLIB = {
-        "hashlib", "http", "os", "posixpath", "re", "socket", "sys", "time",
-        "urllib", "dataclasses", "html", "typing", "__future__",
+        "gzip", "hashlib", "http", "os", "posixpath", "re", "socket", "sys",
+        "time", "unicodedata", "urllib", "zlib", "dataclasses", "html",
+        "typing", "__future__",
     }
 
     def test_only_stdlib_imports(self):
@@ -1076,6 +1097,592 @@ class TestModuleContract(unittest.TestCase):
         download = inspect.signature(scrape.download_xml).parameters
         self.assertEqual(list(download)[:3], ["opener", "ref", "out_dir"])
         self.assertIs(download["overwrite"].default, False)
+
+
+# ---------------------------------------------------------------------------
+# 8. REGRESJE po audycie adwersaryjnym
+#
+# Każdy test odpowiada jednemu ustaleniu.  Serwer HTTP z ``http.server`` nie
+# pozwala udawać obciętej odpowiedzi ani gzipa wbrew negocjacji, więc te testy
+# używają WŁASNEGO serwera na surowym gnieździe TCP.
+# ---------------------------------------------------------------------------
+
+
+class RawSocketServer:
+    """Serwer TCP odpowiadający dokładnie tymi bajtami, które poda handler.
+
+    Potrzebny, bo ``http.server`` sam pilnuje poprawności odpowiedzi — nie da
+    się nim udawać serwera, który kłamie w ``Content-Length``, pakuje wbrew
+    ``Accept-Encoding`` albo sączy dane po bajcie.
+    """
+
+    def __init__(self, handler):
+        self.handler = handler
+        self.sock = socket.socket()
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(16)
+        self.port = self.sock.getsockname()[1]
+        self.hits = []                      # ścieżki kolejnych żądań
+        self.cookies = []                   # (ścieżka, nagłówek Cookie)
+        self._lock = threading.Lock()
+        self._stop = False
+        threading.Thread(target=self._accept_loop, daemon=True).start()
+
+    def _accept_loop(self):
+        while not self._stop:
+            try:
+                conn, _ = self.sock.accept()
+            except OSError:
+                return
+            threading.Thread(target=self._serve, args=(conn,), daemon=True).start()
+
+    def _serve(self, conn):
+        try:
+            conn.settimeout(15)
+            raw = b""
+            while b"\r\n\r\n" not in raw:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    return
+                raw += chunk
+            head = raw.split(b"\r\n", 1)[0].decode("latin-1").split(" ")
+            path = head[1] if len(head) > 1 else "/"
+            cookie = ""
+            for line in raw.decode("latin-1", "replace").split("\r\n"):
+                if line.lower().startswith("cookie:"):
+                    cookie = line.split(":", 1)[1].strip()
+            with self._lock:
+                self.hits.append(path)
+                self.cookies.append((path, cookie))
+            self.handler(self, conn, path, raw)
+        except Exception:                   # serwer testowy nigdy nie psuje testu
+            pass
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
+
+    @property
+    def base(self):
+        return "http://127.0.0.1:%d/" % self.port
+
+    def url(self, path):
+        return "http://127.0.0.1:%d%s" % (self.port, path)
+
+    def count(self, path):
+        with self._lock:
+            return self.hits.count(path)
+
+    def close(self):
+        self._stop = True
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+#: Wzorcowy plik "zawartość pakietu" używany przez testy surowego gniazda.
+RAW_XML = (b"<?xml version='1.0' encoding='UTF-8'?>\n"
+           b"<batch><item><model>ThinkPad T480</model></item>"
+           b"<item><model>Latitude 5400</model></item></batch>\n")
+
+
+def raw_response(conn, status="200 OK", headers=(), body=b""):
+    text = "HTTP/1.1 %s\r\n" % status
+    for key, value in headers:
+        text += "%s: %s\r\n" % (key, value)
+    conn.sendall(text.encode("latin-1") + b"\r\n" + body)
+
+
+def raw_body(conn, body, ctype="application/xml", extra=()):
+    if isinstance(body, str):
+        body = body.encode("utf-8")
+    raw_response(conn, "200 OK",
+                 list(extra) + [("Content-Type", ctype),
+                                ("Content-Length", str(len(body)))], body)
+
+
+class RawServerTestCase(unittest.TestCase):
+    """Baza dla testów na surowym gnieździe: serwer, opener, katalog tymczasowy."""
+
+    def serve(self, handler):
+        server = RawSocketServer(handler)
+        self.addCleanup(server.close)
+        return server
+
+    def opener(self, server, **kw):
+        self.clock = FakeClock()
+        params = dict(delay=0.0, site=server.base, timeout=5.0, retries=0,
+                      sleep=self.clock.sleep, clock=self.clock.monotonic)
+        params.update(kw)
+        return make_opener(**params)
+
+    def tmpdir(self):
+        path = tempfile.mkdtemp(prefix="flexit-reg-")
+        self.addCleanup(shutil.rmtree, path, True)
+        return path
+
+    @staticmethod
+    def ref(server, path="batch.xml", name="batch.xml"):
+        return XmlRef(url=server.base + path, filename=name,
+                      auction_id="auk1", auction_title="Aukcja")
+
+    @staticmethod
+    def auction_ref(server, path="auction/auk1", ident="auk1"):
+        return AuctionRef(url=server.base + path, id=ident, title="Aukcja")
+
+
+class TestIntegralnoscOdpowiedzi(RawServerTestCase):
+    """REGRESJA: obcięta odpowiedź nie może udawać kompletnego pliku."""
+
+    def test_niedobor_wzgledem_content_length_jest_bledem(self):
+        """Serwer deklaruje 5085 B, wysyła 45 B i się rozłącza.
+
+        ``http.client`` świadomie NIE zgłasza tu ``IncompleteRead``, więc bez
+        własnego sprawdzenia ogryzek trafiał na dysk jako komplet i przy
+        kolejnym uruchomieniu był POMIJANY jako "już pobrany" — uszkodzenie
+        było trwałe, a CLI zgłaszało je jako błąd parsowania XML.
+        """
+        def handler(srv, conn, path, req):
+            conn.sendall(("HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\n"
+                          "Content-Length: %d\r\n\r\n" % (len(RAW_XML) + 5000)
+                          ).encode("latin-1") + RAW_XML[:45])
+            conn.close()
+
+        server = self.serve(handler)
+        opener = self.opener(server)
+        out = self.tmpdir()
+        with self.assertRaises(FetchError) as ctx:
+            download_xml(opener, self.ref(server), out)
+        self.assertIn("IncompleteRead", str(ctx.exception))
+        self.assertEqual(os.listdir(out), [], "nic uszkodzonego nie zostaje na dysku")
+
+    def test_niedobor_jest_ponawiany_z_backoffem(self):
+        """Niedobór to błąd sieci — ma prawo do ponowień jak każdy inny."""
+        def handler(srv, conn, path, req):
+            conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\n"
+                         b"Content-Length: 40\r\n\r\n<?xml versi")
+            conn.close()
+
+        server = self.serve(handler)
+        opener = self.opener(server, retries=2)
+        with self.assertRaises(FetchError):
+            fetch(opener, server.base + "b.xml")
+        self.assertEqual(len(server.hits), 3)
+        self.assertEqual(self.clock.slept, [2.0, 4.0])
+
+    def test_nadmiar_wzgledem_content_length_nie_przeszkadza(self):
+        """Serwer, który wysyła WIĘCEJ niż obiecał, nie jest błędem transmisji."""
+        def handler(srv, conn, path, req):
+            raw_response(conn, "200 OK",
+                         [("Content-Type", "application/xml"),
+                          ("Content-Length", "10")], RAW_XML)
+            conn.close()
+
+        server = self.serve(handler)
+        data, _ = fetch(self.opener(server), server.base + "b.xml")
+        self.assertTrue(data.startswith(b"<?xml"))
+
+    def test_odpowiedz_bez_content_length_dziala_jak_dawniej(self):
+        """HTTP/1.0 bez ``Content-Length`` (koniec = rozłączenie)."""
+        def handler(srv, conn, path, req):
+            conn.sendall(b"HTTP/1.0 200 OK\r\nContent-Type: text/xml\r\n\r\n" + RAW_XML)
+            conn.close()
+
+        server = self.serve(handler)
+        data, _ = fetch(self.opener(server), server.base + "b.xml")
+        self.assertEqual(data, RAW_XML)
+
+
+class TestKodowanieTransportowe(RawServerTestCase):
+    """REGRESJA: ``Content-Encoding`` musi być honorowany."""
+
+    def test_gzip_jest_rozpakowywany(self):
+        """Cloudflare i nginx z ``gzip_static`` pakują mimo ``identity``.
+
+        Wcześniej ``download_xml`` widział bajty ``\\x1f\\x8b``, ogłaszał
+        "to nie XML" i radził ``--cookie`` — diagnoza całkowicie myląca.
+        """
+        body = gzip.compress(RAW_XML)
+
+        def handler(srv, conn, path, req):
+            raw_response(conn, "200 OK",
+                         [("Content-Type", "application/xml"),
+                          ("Content-Encoding", "gzip"),
+                          ("Content-Length", str(len(body)))], body)
+
+        server = self.serve(handler)
+        opener = self.opener(server)
+        data, ctype = fetch(opener, server.base + "batch.xml")
+        self.assertEqual(data, RAW_XML)
+        self.assertEqual(ctype, "application/xml")
+        path = download_xml(opener, self.ref(server), self.tmpdir())
+        with open(path, "rb") as handle:
+            self.assertEqual(handle.read(), RAW_XML)
+
+    def test_gzip_na_liscie_aukcji_nie_gubi_linkow(self):
+        page = ('<html><body><a href="/auction/flexit-auctions-18-06-2026-1103">'
+                'Aukcja</a></body></html>').encode("utf-8")
+        body = gzip.compress(page)
+
+        def handler(srv, conn, path, req):
+            raw_response(conn, "200 OK",
+                         [("Content-Type", "text/html; charset=utf-8"),
+                          ("Content-Encoding", "gzip"),
+                          ("Content-Length", str(len(body)))], body)
+
+        server = self.serve(handler)
+        with capture_stderr():
+            found = discover_auctions(self.opener(server), server.base)
+        self.assertEqual([a.id for a in found], ["flexit-auctions-18-06-2026-1103"])
+
+    def test_deflate_jest_rozpakowywany(self):
+        body = zlib.compress(RAW_XML)
+
+        def handler(srv, conn, path, req):
+            raw_response(conn, "200 OK",
+                         [("Content-Type", "application/xml"),
+                          ("Content-Encoding", "deflate"),
+                          ("Content-Length", str(len(body)))], body)
+
+        server = self.serve(handler)
+        data, _ = fetch(self.opener(server), server.base + "b.xml")
+        self.assertEqual(data, RAW_XML)
+
+    def test_uszkodzony_gzip_konczy_sie_fetcherror(self):
+        """Nie da się rozpakować -> błąd transmisji, a nie śmieci na dysku."""
+        def handler(srv, conn, path, req):
+            body = b"\x1f\x8b" + b"popsute"
+            raw_response(conn, "200 OK",
+                         [("Content-Type", "application/xml"),
+                          ("Content-Encoding", "gzip"),
+                          ("Content-Length", str(len(body)))], body)
+
+        server = self.serve(handler)
+        with self.assertRaises(FetchError):
+            fetch(self.opener(server), server.base + "b.xml")
+
+    def test_bomba_zip_jest_zatrzymana_po_rozpakowaniu(self):
+        """Limit ``max_bytes`` obowiązuje także PO dekompresji."""
+        body = gzip.compress(b"<a>" + b"x" * 5_000_000 + b"</a>")
+
+        def handler(srv, conn, path, req):
+            raw_response(conn, "200 OK",
+                         [("Content-Type", "application/xml"),
+                          ("Content-Encoding", "gzip"),
+                          ("Content-Length", str(len(body)))], body)
+
+        server = self.serve(handler)
+        opener = self.opener(server, max_bytes=100_000)
+        with self.assertRaises(ScrapeError) as ctx:
+            fetch(opener, server.base + "b.xml")
+        self.assertIn("limit", str(ctx.exception))
+
+
+class TestRozpoznawaniaXml(RawServerTestCase):
+    """REGRESJA: XML w UTF-16 i XML podany jako ``text/html``."""
+
+    UTF16 = "<?xml version='1.0' encoding='UTF-16'?><batch><i>ąćż</i></batch>"
+
+    def test_looks_like_xml_rozumie_bomy(self):
+        for encoding in ("utf-16", "utf-16-le", "utf-16-be", "utf-32", "utf-8-sig"):
+            with self.subTest(encoding=encoding):
+                self.assertTrue(scrape._looks_like_xml(self.UTF16.encode(encoding)))
+        self.assertFalse(scrape._looks_like_xml("<html><body>x".encode("utf-16")))
+        self.assertFalse(scrape._looks_like_xml(b"<!DOCTYPE html><html>"))
+
+    def test_xml_w_utf16_trafia_na_dysk(self):
+        """Eksporty z narzędzi windowsowych bywają w UTF-16LE.
+
+        Dawniej ``_looks_like_xml`` widziało pierwszy bajt ``\\xff`` i mówiło
+        "to nie XML" — cała aukcja przepadała po cichu.
+        """
+        body = self.UTF16.encode("utf-16")
+
+        def handler(srv, conn, path, req):
+            raw_body(conn, body)
+
+        server = self.serve(handler)
+        path = download_xml(self.opener(server), self.ref(server), self.tmpdir())
+        self.assertEqual(ET.parse(path).getroot().tag, "batch")
+
+    def test_xml_podany_jako_text_html_bez_rozszerzenia(self):
+        """Endpoint eksportu ze źle ustawionym typem MIME (bardzo częste)."""
+        page = ('<html><body><a href="/api/lot/11588/batch">'
+                'Download Batch Details</a></body></html>')
+
+        def handler(srv, conn, path, req):
+            if path.startswith("/api/"):
+                raw_body(conn, RAW_XML, ctype="text/html; charset=utf-8")
+            else:
+                raw_body(conn, page, ctype="text/html; charset=utf-8")
+
+        server = self.serve(handler)
+        opener = self.opener(server)
+        refs = find_xml_links(opener, self.auction_ref(server))
+        self.assertEqual(len(refs), 1)
+        path = download_xml(opener, refs[0], self.tmpdir())
+        with open(path, "rb") as handle:
+            self.assertEqual(handle.read(), RAW_XML)
+
+    def test_prawdziwa_strona_html_dalej_jest_odrzucana(self):
+        """Sniffing treści nie może wpuścić zwykłej strony HTML."""
+        page = ('<html><body><a href="/api/batch">Download Batch Details</a>'
+                '</body></html>')
+
+        def handler(srv, conn, path, req):
+            raw_body(conn, page, ctype="text/html")
+
+        server = self.serve(handler)
+        with capture_stderr():
+            refs = find_xml_links(self.opener(server), self.auction_ref(server))
+        self.assertEqual(refs, [])
+
+
+class TestSondowaniaTypu(RawServerTestCase):
+    """REGRESJA: sonda ``Content-Type`` nie może kosztować drugiego pobrania."""
+
+    def test_niepewny_link_pobierany_tylko_raz(self):
+        page = ('<html><body><a href="/api/batch" download>'
+                'Download Batch Details</a></body></html>')
+
+        def handler(srv, conn, path, req):
+            if path.startswith("/api"):
+                raw_body(conn, RAW_XML, ctype="application/octet-stream")
+            else:
+                raw_body(conn, page, ctype="text/html")
+
+        server = self.serve(handler)
+        opener = self.opener(server)
+        refs = find_xml_links(opener, self.auction_ref(server, "auction/a1", "a1"))
+        self.assertEqual(len(refs), 1)
+        path = download_xml(opener, refs[0], self.tmpdir())
+        with open(path, "rb") as handle:
+            self.assertEqual(handle.read(), RAW_XML)
+        self.assertEqual(server.count("/api/batch"), 1,
+                         "sonda i pobranie to dawniej były dwa transfery")
+
+
+class TestLacznegoTerminu(RawServerTestCase):
+    """REGRESJA: ``--timeout`` musi ograniczać CAŁE pobranie, nie jeden odczyt."""
+
+    def test_saczenie_po_bajcie_jest_przerywane(self):
+        """Serwer sączy po bajcie: żaden pojedynczy odczyt nie łamie timeoutu.
+
+        Bez terminu na całą odpowiedź wrogi lub przeciążony portal trzymał
+        narzędzie dowolnie długo (pomiar w audycie: 13-krotność ``--timeout``).
+        """
+        def handler(srv, conn, path, req):
+            conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\n"
+                         b"Content-Length: 400\r\n\r\n")
+            for _ in range(400):
+                try:
+                    conn.sendall(b"x")
+                    time.sleep(0.05)
+                except OSError:
+                    return
+
+        server = self.serve(handler)
+        # realny zegar: przedmiotem pomiaru jest faktyczny upływ czasu
+        opener = make_opener(delay=0.0, site=server.base, timeout=0.2, retries=0,
+                             sleep=lambda seconds: None)
+        started = time.monotonic()
+        with self.assertRaises(FetchError):
+            fetch(opener, server.base + "drip.xml")
+        elapsed = time.monotonic() - started
+        limit = 0.2 * scrape.RESPONSE_TIMEOUT_FACTOR
+        self.assertLess(elapsed, limit + 2.0,
+                        "pobranie trwało %.1f s przy limicie %.1f s" % (elapsed, limit))
+
+
+class TestSklejaniaCiasteczek(RawServerTestCase):
+    """REGRESJA: ``--cookie`` nie może unieważniać ``http.cookiejar``."""
+
+    @staticmethod
+    def _handler(srv, conn, path, req):
+        if path.endswith(".xml"):
+            raw_body(conn, RAW_XML)
+        else:
+            raw_body(conn, '<html><body><a href="/b.xml">Batch</a></body></html>',
+                     ctype="text/html",
+                     extra=[("Set-Cookie", "csrf=ABC123; Path=/")])
+
+    def test_statyczne_cookie_i_jar_ida_razem(self):
+        """Portal dosyła token CSRF — musi wrócić RAZEM z sesją z ``--cookie``."""
+        server = self.serve(self._handler)
+        opener = self.opener(server, cookie="SESSION=tajne")
+        refs = find_xml_links(opener, self.auction_ref(server))
+        download_xml(opener, refs[0], self.tmpdir())
+        sent = dict(server.cookies)["/b.xml"]
+        self.assertIn("csrf=ABC123", sent)
+        self.assertIn("SESSION=tajne", sent)
+
+    def test_bez_cookie_jar_dziala_jak_dawniej(self):
+        server = self.serve(self._handler)
+        opener = self.opener(server)
+        refs = find_xml_links(opener, self.auction_ref(server))
+        download_xml(opener, refs[0], self.tmpdir())
+        self.assertEqual(dict(server.cookies)["/b.xml"], "csrf=ABC123")
+
+    def test_ciasteczko_serwera_wygrywa_przy_tej_samej_nazwie(self):
+        """Świeższa wartość (od portalu) nie może być zdublowana starą."""
+        merged = scrape._merge_cookie_header("csrf=NOWY", "csrf=STARY; extra=1")
+        self.assertEqual(merged, "csrf=NOWY; extra=1")
+
+
+class TestNaglowkowNiepoprawnych(unittest.TestCase):
+    """REGRESJA: wklejone ciasteczko z Enterem nie może wywalić CLI."""
+
+    def test_koncowy_enter_jest_obcinany(self):
+        opener = make_opener(cookie="SESSIONID=abc\n", delay=0.0)
+        self.assertEqual(opener.cookie, "SESSIONID=abc")
+        opener = make_opener(user_agent="  MojUA/1.0  ", delay=0.0)
+        self.assertEqual(opener.user_agent, "MojUA/1.0")
+
+    def test_znak_konca_linii_w_srodku_to_czytelny_blad(self):
+        for kwargs in ({"cookie": "A=1\nX-Zle: 1"},
+                       {"user_agent": "UA\r\nX-Wstrzykniete: 1"}):
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaises(ScrapeError) as ctx:
+                    make_opener(delay=0.0, **kwargs)
+                self.assertIn("końca linii", str(ctx.exception))
+
+    def test_puste_ciasteczko_znaczy_brak_ciasteczka(self):
+        self.assertIsNone(make_opener(cookie="   ", delay=0.0).cookie)
+
+
+class TestGranicyZrodla(unittest.TestCase):
+    """REGRESJA: ciasteczko sesyjne tylko do źródła portalu i jego poddomen."""
+
+    def test_obca_domena_w_tym_samym_sufiksie_publicznym(self):
+        cases = [
+            ("https://sklep.example.co.uk/", "https://evil.co.uk/kradnij"),
+            ("https://aukcje.com.pl/", "https://zlodziej.com.pl/kradnij"),
+            ("https://przetargi.gov.pl/", "https://falszywy.gov.pl/kradnij"),
+            ("https://klient.github.io/", "https://atakujacy.github.io/kradnij"),
+        ]
+        for base, url in cases:
+            with self.subTest(base=base):
+                self.assertFalse(is_same_site(base, url))
+
+    def test_inny_port_to_inne_zrodlo_takze_dla_nazw(self):
+        self.assertFalse(is_same_site("http://intranet:8080/", "http://intranet:9200/"))
+        self.assertTrue(is_same_site("http://intranet:8080/", "http://intranet:8080/a"))
+
+    def test_poddomeny_portalu_dalej_dzialaja(self):
+        base = "https://flexitauctions.com/"
+        self.assertTrue(is_same_site(base, "https://media.flexitauctions.com/a.xml"))
+        self.assertTrue(is_same_site(base, "http://www.flexitauctions.com/x"))
+        self.assertTrue(is_same_site("https://www.flexitauctions.com/",
+                                     "https://flexitauctions.com/x"))
+
+
+class TestWyciekuCiasteczka(RawServerTestCase):
+    """REGRESJA: przekierowanie na inny port nie dostaje ciasteczka."""
+
+    def test_przekierowanie_na_inny_port_jest_blokowane(self):
+        widziane = []
+
+        def ofiara(srv, conn, path, req):
+            widziane.append(req.decode("latin-1", "replace"))
+            raw_body(conn, "<html>ok</html>", ctype="text/html")
+
+        victim = self.serve(ofiara)
+
+        def portal(srv, conn, path, req):
+            raw_response(conn, "302 Found",
+                         [("Location", victim.url("/kradnij")), ("Content-Length", "0")])
+
+        server = self.serve(portal)
+        opener = self.opener(server, cookie="SESSIONID=TAJNY-TOKEN")
+        with self.assertRaises(ScrapeError):
+            fetch(opener, server.base)
+        self.assertEqual(widziane, [], "serwer-ofiara nie zobaczył żadnego żądania")
+
+
+class TestSekwencjiSterujacych(RawServerTestCase):
+    """REGRESJA: treść z portalu nie steruje terminalem użytkownika."""
+
+    HTML = ("<html><head><title>Aukcje\x1b]0;PRZEJETY-TYTUL\x07</title></head><body>"
+            "<a href='/auction/flexit-\x1b[2J\x1b[31mKRWAWY-1103/'>"
+            "Lot \x1b[5mMIGA\x1b[0m</a></body></html>").encode("utf-8")
+
+    def test_id_tytul_i_raport_bez_znakow_sterujacych(self):
+        def handler(srv, conn, path, req):
+            raw_body(conn, self.HTML, ctype="text/html; charset=utf-8")
+
+        server = self.serve(handler)
+        auctions = discover_auctions(self.opener(server), server.base)
+        self.assertEqual(len(auctions), 1)
+        for text in (auctions[0].id, auctions[0].title):
+            self.assertNotIn("\x1b", text)
+            self.assertNotIn("\x07", text)
+        report = describe_page(self.HTML, "http://x/", content_type="text/html")
+        self.assertNotIn("\x1b", report)
+        self.assertNotIn("\x07", report)
+
+    def test_ostrzezenia_modulu_sa_czyszczone(self):
+        with capture_stderr() as err:
+            scrape._warn("adres \x1b[2J/kradnij")
+        self.assertNotIn("\x1b", err.getvalue())
+
+
+class TestSkanowaniaSpa(RawServerTestCase):
+    """REGRESJA: względny adres ``.xml`` w osadzonym JSON-ie."""
+
+    def test_wzgledny_adres_xml_w_json_jest_znajdowany(self):
+        spa = ('<html><body><script type="application/json">'
+               '{"batchUrl":"batch/11588.xml"}</script></body></html>')
+
+        def handler(srv, conn, path, req):
+            if path.endswith(".xml"):
+                raw_body(conn, RAW_XML)
+            else:
+                raw_body(conn, spa, ctype="text/html")
+
+        server = self.serve(handler)
+        refs = find_xml_links(
+            self.opener(server),
+            self.auction_ref(server, "auction/auk1/lot-abc12"),
+        )
+        self.assertEqual([r.url for r in refs],
+                         [server.url("/auction/auk1/batch/11588.xml")])
+
+    def test_atrybut_download_nie_jest_mylony_z_adresem(self):
+        """``download="batch.xml"`` to nazwa pliku, nie ścieżka do pobrania."""
+        page = ('<html><body><a href="/dl/7" download="batch-7.xml">'
+                'Download Batch Details</a></body></html>')
+
+        def handler(srv, conn, path, req):
+            if path.startswith("/dl/"):
+                raw_body(conn, RAW_XML)
+            else:
+                raw_body(conn, page, ctype="text/html")
+
+        server = self.serve(handler)
+        refs = find_xml_links(self.opener(server), self.auction_ref(server))
+        self.assertEqual([r.url for r in refs], [server.url("/dl/7")])
+
+
+class TestNazwZPolskimiZnakami(unittest.TestCase):
+    """REGRESJA: nazwa spoza ASCII ma dalej identyfikować plik."""
+
+    def test_transliteracja_zamiast_kasowania(self):
+        self.assertEqual(safe_filename("zawartość pakietu.xml"), "zawartosc_pakietu.xml")
+        self.assertEqual(safe_filename("ł ą ż.xml"), "l_a_z.xml")
+        self.assertEqual(safe_filename("ąęó.xml"), "aeo.xml")
+
+    def test_wynik_jest_dalej_czystym_ascii(self):
+        for raw in ("zażółć gęślą.xml", "Straße.xml", "Ærø.xml", "日本語.xml"):
+            with self.subTest(raw=raw):
+                got = safe_filename(raw)
+                self.assertTrue(all(ord(ch) < 128 for ch in got), got)
+                self.assertTrue(got.endswith(".xml"))
+
+    def test_nazwy_z_samych_znakow_niedrukowalnych_maja_zapas(self):
+        self.assertEqual(safe_filename("日本語.xml"), "xml.xml")
 
 
 if __name__ == "__main__":  # pragma: no cover

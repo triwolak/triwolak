@@ -37,21 +37,51 @@ Decyzje projektowe (świadome, bo kontrakt ich nie rozstrzyga)
 
 * Kolumny techniczne mają STAŁE nazwy; gdy XML ma własne pole o takiej samej
   nazwie, kolumna z XML-a dostaje przyrostek ``(XML)`` — nic nie ginie.
+* Wejściem może być katalog, POJEDYNCZY PLIK albo ARCHIWUM ``.zip``/``.gz``.
+  Pliki z archiwum są wypakowywane do katalogu tymczasowego (sprzątanego przy
+  wyjściu) pod nazwą niosącą ślad pochodzenia — kolumna ``Plik`` dalej mówi,
+  skąd wziął się wiersz.
+* Pliki o IDENTYCZNEJ treści są wykrywane (rozmiar, potem suma kontrolna).
+  Domyślnie tylko ostrzegamy, bo to użytkownik wie, czy druga kopia jest
+  pomyłką; ``--skip-duplicates`` każe je pominąć.
+* ``--csv`` zapisuje arkusz zbiorczy DODATKOWO jako CSV, a gdy zapis XLSX się
+  nie powiedzie, CSV powstaje automatycznie (zapis ratunkowy) — nieudany zapis
+  nie może kosztować godzin pobierania.
 * ``build`` NIE nadpisuje istniejącego pliku ``.xlsx`` bez ``--overwrite``
   (łatwo pomylić katalogi; zniszczony wynik pracy boli bardziej niż komunikat).
 * Błąd pojedynczego pliku XML nigdy nie przerywa całości — trafia do arkusza
   ``Podsumowanie``, na ``stderr`` i do kodu wyjścia 3.
 * Kolejność plików jest deterministyczna (sortowanie po ścieżce), żeby dwa
   uruchomienia dawały identyczny wynik.
+* **Potok jest strumieniowy.**  ``load_documents`` zwraca lekkie uchwyty
+  (:class:`DocHandle`); rekordy zostają w pamięci tylko do wysokości
+  :data:`MEMORY_ROW_BUDGET`, a powyżej — plik jest parsowany ponownie dopiero
+  wtedy, gdy generator wierszy do niego dojdzie.  Kosztem jest drugi odczyt
+  z dysku, zyskiem — szczyt pamięci ``O(największy plik)`` zamiast
+  ``O(cały korpus)``.
+* ``all`` sprawdza plik z ``--out`` PRZED pierwszym żądaniem HTTP — inaczej
+  kilkanaście minut uprzejmego pobierania kończyłoby się komunikatem
+  "dodaj --overwrite".
+* Żaden błąd nie wychodzi z ``main`` tracebackiem: ``MemoryError`` i wszystko
+  inne kończy się zdaniem po polsku i kodem z tabeli powyżej.
+* Pomoc i komunikaty składniowe argparse są tłumaczone na polski
+  (:class:`PolishArgumentParser`), bo to one witają użytkownika przy pomyłce.
 """
 
 from __future__ import annotations
 
 import argparse
+import atexit
+import csv
+import gzip
+import hashlib
 import os
 import re
+import shutil
 import sys
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
+import tempfile
+import zipfile
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Set, Tuple
 
 from . import values, xlsxwrite, xmlflatten
 from .xlsxwrite import Sheet
@@ -60,8 +90,12 @@ __all__ = [
     "main",
     "build_parser",
     "collect_xml_files",
+    "expand_archive",
+    "find_duplicate_files",
     "load_documents",
     "build_sheets",
+    "collective_table",
+    "write_csv",
     "TECH_COLUMNS",
     "SHEET_ALL",
     "SHEET_SUMMARY",
@@ -110,6 +144,51 @@ DEFAULT_BASE_URL = "https://flexitauctions.com/"
 
 #: Rozszerzenia uznawane za pliki XML przy przeszukiwaniu katalogu.
 XML_SUFFIXES = (".xml",)
+
+#: Archiwa, z których CLI samo wyjmuje pliki XML.  Portal (i przeglądarka przy
+#: "pobierz wszystko") potrafi oddać paczkę ZIP, a użytkownik pakuje katalog,
+#: zanim go przeniesie na inny komputer — bez tego dostawał "nie znalazłem
+#: żadnego pliku .xml" nad katalogiem pełnym danych.
+ZIP_SUFFIXES = (".zip",)
+
+#: Pojedyncze pliki spakowane gzipem (``batch.xml.gz``).
+GZIP_SUFFIXES = (".gz",)
+
+#: Górny limit sumy bajtów wypakowanych z JEDNEGO archiwum — ochrona przed
+#: "bombą zip" (kilkadziesiąt kB potrafi rozwinąć się w gigabajty).
+MAX_ARCHIVE_BYTES = 512 * 1024 * 1024
+
+#: Ile poziomów archiwum w archiwum rozpakowywać (paczka paczek — po jednej na
+#: lot — zdarza się przy "pobierz wszystko"; głębiej to już tylko ryzyko).
+MAX_ARCHIVE_DEPTH = 2
+
+#: Co ile wierszy pokazywać postęp przy zapisie (najdłuższa i dotąd całkiem
+#: niema faza pracy: przy 300 plikach potrafi trwać minuty).
+PROGRESS_ROWS = 25_000
+
+#: Domyślny separator pola w eksporcie CSV.  Średnik, bo taki jest domyślny
+#: separator listy w polskim Excelu — plik otwiera się dwuklikiem, bez kreatora.
+DEFAULT_CSV_SEP = ";"
+
+#: Ile wierszy wolno trzymać naraz w pamięci po wczytaniu plików.
+#:
+#: Poniżej tej granicy dokumenty zostają w pamięci (jedno parsowanie, szybciej),
+#: powyżej — CLI je zwalnia i parsuje pliki ponownie dopiero w chwili zapisu.
+#: Dzięki temu szczyt pamięci zależy od NAJWIĘKSZEGO pliku, a nie od sumy
+#: wszystkich (``xlsxwrite`` i tak zapisuje strumieniowo).
+MEMORY_ROW_BUDGET = 100_000
+
+#: Ile kandydatów na ścieżkę rekordu wolno wypróbować w ``unify_record_paths``.
+#: Dalsze i tak prawie nigdy nie pasują, a każdy kosztuje jedno parsowanie.
+UNIFY_MAX_CANDIDATES = 3
+
+#: Ile wyników ``coerce_value`` pamiętać (wartości w kolumnach powtarzają się
+#: masowo: grade, jednostki, pola kontekstu w każdym wierszu).  Rozmiar dobrany
+#: tak, żeby bufor sam nie zjadł zysku z pracy strumieniowej.
+TYPE_CACHE_MAX = 50_000
+
+#: Dłuższych napisów nie cache'ujemy — pamięć ważniejsza niż te kilka trafień.
+TYPE_CACHE_MAX_LEN = 200
 
 EXIT_OK = 0
 EXIT_ERROR = 1
@@ -190,15 +269,209 @@ def _short(text: str, limit: int = 300) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Wejście: archiwa ZIP / GZIP
+# --------------------------------------------------------------------------- #
+
+#: Katalog tymczasowy na pliki wyjęte z archiwów (tworzony leniwie, jeden na
+#: uruchomienie, sprzątany przy wyjściu z programu).
+_SCRATCH: List[str] = []
+
+#: Nazwy plików już zajęte w katalogu tymczasowym (bez rozróżniania wielkości).
+_USED_NAMES: Set[str] = set()
+
+#: Zapamiętane wyniki wypakowania: ``(ścieżka, rozmiar, mtime) -> lista plików``.
+#: Bez tego ``all`` wypakowywałoby to samo archiwum dwa razy (raz przy
+#: sprawdzeniu katalogu, raz przy budowaniu) i dublowało wiersze.
+_ARCHIVE_CACHE: Dict[Tuple[str, int, int], List[str]] = {}
+
+#: Wszystko poza literami, cyframi, ``.``, ``-`` i ``_`` zamieniamy na ``_``.
+_SAFE_NAME_RE = re.compile(r"[^\w.-]+", re.UNICODE)
+
+
+def cleanup_archives() -> None:
+    """Usuwa pliki wypakowane z archiwów (wołane automatycznie przy wyjściu)."""
+    while _SCRATCH:
+        shutil.rmtree(_SCRATCH.pop(), ignore_errors=True)
+    _USED_NAMES.clear()
+    _ARCHIVE_CACHE.clear()
+
+
+def _scratch_dir() -> str:
+    """Katalog tymczasowy na wypakowane pliki (tworzony przy pierwszym użyciu)."""
+    if not _SCRATCH:
+        _SCRATCH.append(tempfile.mkdtemp(prefix="flexit2xlsx-"))
+        atexit.register(cleanup_archives)
+    return _SCRATCH[0]
+
+
+def _safe_base(name: str) -> str:
+    """Bezpieczna nazwa pliku z (niezaufanej) nazwy wpisu w archiwum.
+
+    Archiwum może zawierać wpisy typu ``../../.bashrc`` albo ``C:\\Windows\\x``.
+    Struktury katalogów NIE odtwarzamy: cała nazwa staje się JEDNYM członem,
+    więc nie da się wyjść poza katalog tymczasowy (path traversal).
+    """
+    flat = _SAFE_NAME_RE.sub("_", str(name).replace("\\", "/").strip("/")).strip("_")
+    if not flat or flat in (".", ".."):
+        flat = "plik.xml"
+    return flat[-120:]
+
+
+def _scratch_path(name: str) -> str:
+    """Wolna ścieżka w katalogu tymczasowym dla pliku o (mniej więcej) tej nazwie."""
+    base = _safe_base(name)
+    root, ext = os.path.splitext(base)
+    candidate = base
+    counter = 2
+    while candidate.lower() in _USED_NAMES:
+        candidate = "%s_%d%s" % (root, counter, ext)
+        counter += 1
+    _USED_NAMES.add(candidate.lower())
+    return os.path.join(_scratch_dir(), candidate)
+
+
+def _copy_limited(source: Any, sink: Any, budget: int) -> int:
+    """Przepisuje strumień, pilnując limitu bajtów (ochrona przed bombą zip)."""
+    written = 0
+    while True:
+        chunk = source.read(256 * 1024)
+        if not chunk:
+            return written
+        written += len(chunk)
+        if written > budget:
+            raise ValueError(
+                "po rozpakowaniu przekracza limit %d MB" % (MAX_ARCHIVE_BYTES // 1048576)
+            )
+        sink.write(chunk)
+
+
+def _extract_zip(path: str, reporter: Reporter, depth: int = 0) -> List[str]:
+    """Wyjmuje pliki ``*.xml`` z archiwum ZIP do katalogu tymczasowego.
+
+    Archiwum w archiwum (portal potrafi oddać paczkę paczek — jedną na lot)
+    jest rozpakowywane rekurencyjnie do :data:`MAX_ARCHIVE_DEPTH` poziomów.
+    """
+    label = os.path.basename(path)
+    stem = os.path.splitext(label)[0]
+    found: List[str] = []
+    nested: List[str] = []
+    budget = MAX_ARCHIVE_BYTES
+    try:
+        with zipfile.ZipFile(path) as archive:
+            members = [info for info in archive.infolist() if not info.is_dir()]
+            members.sort(key=lambda info: info.filename)
+            wanted = [
+                info for info in members
+                if (info.filename.lower().endswith(XML_SUFFIXES)
+                    or (depth < MAX_ARCHIVE_DEPTH and _is_archive(info.filename)))
+                and not info.filename.startswith("__MACOSX/")
+                and not os.path.basename(info.filename).startswith(".")
+            ]
+            if not wanted:
+                reporter.warn(
+                    "Archiwum %s nie zawiera plików .xml (wpisów w środku: %d)"
+                    % (label, len(members))
+                )
+                return []
+            for info in wanted:
+                try:
+                    destination = _scratch_path("%s__%s" % (stem, info.filename))
+                    with archive.open(info) as source:
+                        with open(destination, "wb") as sink:
+                            budget -= _copy_limited(source, sink, budget)
+                except RuntimeError as exc:      # archiwum zabezpieczone hasłem
+                    reporter.warn(
+                        "Nie wyjmę %s z %s — %s. Rozpakuj archiwum ręcznie "
+                        "(program nie zna hasła) i wskaż katalog przez --in."
+                        % (info.filename, label, _short(exc))
+                    )
+                    continue
+                except (zipfile.BadZipFile, OSError, EOFError, ValueError) as exc:
+                    reporter.warn(
+                        "Nie wyjmę %s z %s — %s" % (info.filename, label, _short(exc))
+                    )
+                    continue
+                if _is_archive(destination):
+                    nested.append(destination)
+                else:
+                    found.append(destination)
+    except (zipfile.BadZipFile, OSError, EOFError, ValueError, RuntimeError) as exc:
+        reporter.warn("Pomijam archiwum %s — %s" % (label, _short(exc)))
+        return []
+    if found:
+        reporter.info("  archiwum %s: wyjęto %s" % (label, _files(len(found))))
+    for inner in nested:
+        if inner.lower().endswith(ZIP_SUFFIXES):
+            found.extend(_extract_zip(inner, reporter, depth + 1))
+        else:
+            found.extend(_extract_gzip(inner, reporter))
+    return found
+
+
+def _extract_gzip(path: str, reporter: Reporter) -> List[str]:
+    """Rozpakowuje pojedynczy plik ``*.gz`` (typowo ``batch.xml.gz``)."""
+    label = os.path.basename(path)
+    inner = label[:-3] if label.lower().endswith(".gz") else label
+    if not inner.lower().endswith(XML_SUFFIXES):
+        inner += ".xml"
+    destination = _scratch_path(inner)
+    try:
+        with gzip.open(path, "rb") as source:
+            with open(destination, "wb") as sink:
+                _copy_limited(source, sink, MAX_ARCHIVE_BYTES)
+    except (OSError, EOFError, ValueError) as exc:
+        reporter.warn("Pomijam %s — nie mogę rozpakować (%s)" % (label, _short(exc)))
+        return []
+    reporter.info("  rozpakowano %s" % label)
+    return [destination]
+
+
+def _is_archive(name: str) -> bool:
+    """Czy nazwa wygląda na archiwum, które umiemy otworzyć?"""
+    lower = name.lower()
+    return lower.endswith(ZIP_SUFFIXES) or lower.endswith(GZIP_SUFFIXES)
+
+
+def expand_archive(path: str, reporter: Optional[Reporter] = None) -> List[str]:
+    """Zwraca pliki XML wyjęte z archiwum ``path`` (ZIP albo GZIP).
+
+    Wynik jest zapamiętywany po ``(ścieżka, rozmiar, czas modyfikacji)``, więc
+    dwa wywołania dla tego samego archiwum dają te SAME ścieżki — inaczej
+    podkomenda ``all`` (która ogląda katalog dwa razy) zdublowałaby wiersze.
+    Wypakowane pliki znikają razem z końcem programu.
+    """
+    reporter = reporter or Reporter(quiet=True)
+    try:
+        info = os.stat(path)
+        key: Optional[Tuple[str, int, int]] = (
+            os.path.normcase(os.path.abspath(path)), info.st_size, int(info.st_mtime)
+        )
+    except OSError:
+        key = None
+    if key is not None and key in _ARCHIVE_CACHE:
+        return list(_ARCHIVE_CACHE[key])
+    if path.lower().endswith(ZIP_SUFFIXES):
+        found = _extract_zip(path, reporter)
+    else:
+        found = _extract_gzip(path, reporter)
+    if key is not None:
+        _ARCHIVE_CACHE[key] = list(found)
+    return found
+
+
+# --------------------------------------------------------------------------- #
 # Wejście: zbieranie plików XML
 # --------------------------------------------------------------------------- #
 
 
 def collect_xml_files(paths: Sequence[str], reporter: Optional[Reporter] = None) -> List[str]:
-    """Zamienia listę ścieżek (katalogi i/lub pliki) na posortowaną listę plików XML.
+    """Zamienia listę ścieżek (katalogi, pliki, archiwa) na listę plików XML.
 
-    * katalog — przeszukiwany rekurencyjnie, brane pliki ``*.xml``
-      (z pominięciem katalogów ukrytych i plików ``.part`` po przerwanym pobieraniu),
+    * katalog — przeszukiwany rekurencyjnie, brane pliki ``*.xml`` oraz archiwa
+      ``*.zip`` / ``*.gz`` (z pominięciem katalogów ukrytych i plików ``.part``
+      po przerwanym pobieraniu),
+    * archiwum — pliki ``*.xml`` z jego wnętrza są wypakowywane do katalogu
+      tymczasowego i traktowane jak zwykłe pliki wejściowe,
     * plik — brany dosłownie, niezależnie od rozszerzenia (użytkownik wie, co robi),
     * ścieżka nieistniejąca — ostrzeżenie, praca trwa dalej.
 
@@ -226,20 +499,202 @@ def collect_xml_files(paths: Sequence[str], reporter: Optional[Reporter] = None)
                         continue
                     if name.lower().endswith(XML_SUFFIXES):
                         batch.append(os.path.join(root, name))
+                    elif _is_archive(name):
+                        batch.extend(expand_archive(os.path.join(root, name), reporter))
             if not batch:
-                reporter.warn("Katalog %s nie zawiera plików .xml" % path)
+                reporter.warn(
+                    "Katalog %s nie zawiera plików .xml ani archiwów .zip/.gz" % path
+                )
             for item in batch:
                 remember(item)
         elif os.path.isfile(path):
-            remember(path)
+            if _is_archive(path):
+                for item in expand_archive(path, reporter):
+                    remember(item)
+            else:
+                remember(path)
         else:
             reporter.warn("Pomijam %s — nie ma takiego pliku ani katalogu" % path)
     return found
 
 
 # --------------------------------------------------------------------------- #
+# Wejście: powtórzone pliki
+# --------------------------------------------------------------------------- #
+
+
+def _digest(path: str) -> Optional[str]:
+    """Suma kontrolna zawartości pliku (``None``, gdy pliku nie da się czytać)."""
+    checksum = hashlib.sha256()
+    try:
+        with open(path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(256 * 1024), b""):
+                checksum.update(chunk)
+    except OSError:
+        return None
+    return checksum.hexdigest()
+
+
+def find_duplicate_files(files: Sequence[str]) -> Dict[str, str]:
+    """Wskazuje pliki o treści IDENTYCZNEJ z innym plikiem z listy.
+
+    Ten sam pakiet bywa na portalu pod dwoma adresami (``/lot/…`` i
+    ``/auction/…/…``), a użytkownik pobiera go raz z przeglądarki i raz
+    programem — w arkuszu te same sztuki policzyłyby się dwa razy, cicho
+    zawyżając stan magazynu.  Zwraca odwzorowanie
+    ``duplikat -> pierwszy plik o tej samej treści``.
+
+    Najpierw grupujemy po rozmiarze (identyczne pliki MUSZĄ mieć ten sam
+    rozmiar), więc w katalogu bez powtórzeń nie liczymy żadnej sumy kontrolnej.
+    """
+    by_size: Dict[int, List[str]] = {}
+    for path in files:
+        try:
+            by_size.setdefault(os.path.getsize(path), []).append(path)
+        except OSError:
+            continue
+    duplicates: Dict[str, str] = {}
+    for group in by_size.values():
+        if len(group) < 2:
+            continue
+        first_with: Dict[str, str] = {}
+        for path in group:
+            digest = _digest(path)
+            if digest is None:
+                continue
+            if digest in first_with:
+                duplicates[path] = first_with[digest]
+            else:
+                first_with[digest] = path
+    return duplicates
+
+
+# --------------------------------------------------------------------------- #
 # Wczytywanie dokumentów
 # --------------------------------------------------------------------------- #
+
+
+class DocHandle:
+    """Wczytany plik XML: metadane zawsze w pamięci, rekordy — na żądanie.
+
+    Po co: ``load_documents`` trzymało wszystkie ``ParsedDoc`` (z kompletem
+    rekordów) aż do końca zapisu, więc szczyt pamięci rósł LINIOWO z rozmiarem
+    całego korpusu (~715 B na wiersz; milion wierszy = ponad 800 MB).  Tymczasem
+    ``xlsxwrite`` zapisuje strumieniowo i potrzebuje tylko jednego wiersza naraz.
+
+    Uchwyt pamięta to, czego potrzebuje arkusz ``Podsumowanie`` i unia kolumn
+    (źródło, aukcja, ścieżka rekordu, kolumny, liczba pozycji), a sam dokument
+    trzyma tylko dopóki mieści się w budżecie :data:`MEMORY_ROW_BUDGET`.
+    Powyżej budżetu plik jest parsowany ponownie dopiero w chwili, gdy przychodzi
+    jego kolej w generatorze wierszy — szczyt pamięci spada z ``O(cały korpus)``
+    do ``O(największy plik)``.
+    """
+
+    __slots__ = ("source", "auction", "record_path", "columns", "count", "_kw", "_doc")
+
+    def __init__(self, doc: xmlflatten.ParsedDoc, parse_kw: Dict[str, Any]) -> None:
+        self._kw = dict(parse_kw)
+        self._doc = doc
+        self._absorb(doc)
+
+    def _absorb(self, doc: xmlflatten.ParsedDoc) -> None:
+        self.source = doc.source
+        self.auction = doc.auction
+        self.record_path = doc.record_path
+        self.columns = list(doc.columns)
+        self.count = len(doc.records)
+
+    @property
+    def cached(self) -> bool:
+        """Czy dokument jest jeszcze w pamięci (bez ponownego parsowania)?"""
+        return self._doc is not None
+
+    def release(self) -> None:
+        """Zwalnia rekordy z pamięci — zostaje sama metryczka."""
+        self._doc = None
+
+    def load(self) -> xmlflatten.ParsedDoc:
+        """Zwraca pełny dokument (parsując plik ponownie, gdy trzeba)."""
+        if self._doc is not None:
+            return self._doc
+        return xmlflatten.parse_file(self.source, **self._kw)
+
+    def adopt(self, doc: xmlflatten.ParsedDoc, record_path: Optional[str]) -> None:
+        """Podmienia dokument po ujednoliceniu ścieżki rekordu."""
+        self._kw["record_path"] = record_path
+        if self._doc is not None:
+            self._doc = doc
+        self._absorb(doc)
+
+
+def _doc_source(doc: Any) -> xmlflatten.ParsedDoc:
+    """Pełny ``ParsedDoc`` — z uchwytu albo wprost (gdy ktoś podał dokument)."""
+    loader = getattr(doc, "load", None)
+    return loader() if callable(loader) else doc
+
+
+def _doc_count(doc: Any) -> int:
+    """Liczba pozycji bez wciągania rekordów do pamięci."""
+    count = getattr(doc, "count", None)
+    if count is None:
+        return len(doc.records)
+    return int(count)
+
+
+def _looks_like_html(path: str) -> bool:
+    """Czy plik zaczyna się jak strona HTML (zapisana ściana logowania)?"""
+    try:
+        with open(path, "rb") as handle:
+            head = handle.read(2048)
+    except OSError:
+        return False
+    head = head.lstrip(b"\xef\xbb\xbf").lstrip().lower()
+    if head.startswith((b"<!doctype html", b"<html")):
+        return True
+    # bywa i tak: <?xml ...?> a zaraz potem XHTML-owa strona logowania
+    return head.startswith(b"<?xml") and b"<html" in head[:1024]
+
+
+def _archive_kind(path: str) -> Optional[str]:
+    """Czy plik jest archiwum udającym XML? (``PK`` = ZIP, ``\\x1f\\x8b`` = GZIP)
+
+    Zdarza się to często: przeglądarka zapisuje paczkę pod nazwą ``batch.xml``,
+    a użytkownik widzi tylko "uszkodzony XML" i nie wie, że wystarczy zmienić
+    rozszerzenie.
+    """
+    try:
+        with open(path, "rb") as handle:
+            head = handle.read(4)
+    except OSError:
+        return None
+    if head[:4] == b"PK\x03\x04":
+        return ".zip"
+    if head[:2] == b"\x1f\x8b":
+        return ".gz"
+    return None
+
+
+def _parse_failure_message(path: str, exc: BaseException) -> str:
+    """Zamienia wyjątek parsera na komunikat, z którym użytkownik coś zrobi."""
+    if isinstance(exc, MemoryError):
+        return (
+            "za mało pamięci na wczytanie tego pliku — podziel katalog na części, "
+            "użyj --limit albo wskaż --record-path, żeby ograniczyć liczbę kolumn"
+        )
+    if _looks_like_html(path):
+        return (
+            "to strona HTML, a nie XML — prawdopodobnie zapisała się strona "
+            "logowania portalu (wygasła sesja). Zaloguj się w przeglądarce i "
+            "pobierz plik jeszcze raz albo użyj: download --cookie \"...\""
+        )
+    kind = _archive_kind(path)
+    if kind:
+        return (
+            "to archiwum %s zapisane pod nazwą .xml — zmień rozszerzenie na %s, "
+            "a program sam wyjmie z niego pliki XML"
+            % (kind.lstrip(".").upper(), kind)
+        )
+    return _short(exc)
 
 
 def load_documents(
@@ -250,47 +705,92 @@ def load_documents(
     record_path: Optional[str] = None,
     strip_ns: bool = True,
     reporter: Optional[Reporter] = None,
-) -> Tuple[List[xmlflatten.ParsedDoc], List[Tuple[str, str]]]:
+) -> Tuple[List[Any], List[Tuple[str, str]]]:
     """Parsuje pliki XML; błąd JEDNEGO pliku nie przerywa całości.
 
-    Zwraca ``(dokumenty, błędy)``, gdzie błąd to para ``(ścieżka, komunikat)``.
+    Zwraca ``(uchwyty, błędy)``, gdzie uchwyt to :class:`DocHandle` (udostępnia
+    ``source``, ``auction``, ``record_path``, ``columns`` i ``count``), a błąd —
+    para ``(ścieżka, komunikat)``.  Rekordy są trzymane w pamięci tylko do
+    wysokości :data:`MEMORY_ROW_BUDGET`; powyżej niej pliki są parsowane
+    ponownie dopiero przy generowaniu wierszy.
     """
     reporter = reporter or Reporter(quiet=True)
-    docs: List[xmlflatten.ParsedDoc] = []
+    parse_kw = {
+        "repeat": repeat,
+        "join_sep": join_sep,
+        "record_path": record_path,
+        "strip_ns": strip_ns,
+    }
+    docs: List[Any] = []
     errors: List[Tuple[str, str]] = []
-    for path in files:
+    kept_rows = 0
+    streaming = False
+    total = len(files)
+    for number, path in enumerate(files, 1):
         try:
-            doc = xmlflatten.parse_file(
-                path,
-                repeat=repeat,
-                join_sep=join_sep,
-                record_path=record_path,
-                strip_ns=strip_ns,
-            )
-        except ValueError as exc:  # XmlParseError też jest ValueError
-            message = _short(exc)
+            doc = xmlflatten.parse_file(path, **parse_kw)
+        # MemoryError NIE dziedziczy po ValueError/OSError, a bez tej gałęzi
+        # brak pamięci kończył się surowym tracebackiem zamiast komunikatem
+        except (ValueError, OSError, MemoryError) as exc:
+            message = _parse_failure_message(path, exc)
             errors.append((path, message))
             reporter.warn("Pomijam %s — %s" % (os.path.basename(path), message))
             continue
-        except OSError as exc:
-            message = _short("nie udało się odczytać pliku: %s" % exc)
-            errors.append((path, message))
-            reporter.warn("Pomijam %s — %s" % (os.path.basename(path), message))
-            continue
-        docs.append(doc)
+        handle = DocHandle(doc, parse_kw)
+        del doc
+        docs.append(handle)
+        if streaming:
+            handle.release()
+        else:
+            kept_rows += handle.count
+            if kept_rows > MEMORY_ROW_BUDGET:
+                # przekroczyliśmy budżet — od tej chwili pracujemy strumieniowo
+                streaming = True
+                for earlier in docs:
+                    earlier.release()
+        # Licznik [k/N] jest tu po to, żeby przy 300 plikach było widać, że coś
+        # się dzieje i ile jeszcze zostało — bez niego praca wygląda na zawieszoną.
         reporter.info(
-            "  %-40s aukcja=%s, %s"
+            "  [%d/%d] %-40s aukcja=%s, %s"
             % (
+                number,
+                total,
                 _short(os.path.basename(path), 40),
-                doc.auction,
-                _plural(len(doc.records), "pozycja", "pozycje", "pozycji"),
+                handle.auction,
+                _plural(handle.count, "pozycja", "pozycje", "pozycji"),
             )
         )
     return docs, errors
 
 
+def _tag_of(record_path: str) -> str:
+    """Ostatni segment ścieżki rekordu (``batch/lot/items/item`` -> ``item``)."""
+    return (record_path or "").rstrip("/").rsplit("/", 1)[-1]
+
+
+def _tag_in_bytes(data: bytes, tag: str) -> bool:
+    """Czy w surowych bajtach pliku w ogóle występuje znacznik o tej nazwie?
+
+    Tani przedfiltr: bez niego ``unify_record_paths`` próbował KAŻDEJ ścieżki
+    w KAŻDYM pliku (koszt iloczynowy — 400 plików x 400 ścieżek to 160 000
+    parsowań i 22 MB odczytu dla katalogu ważącego 0,5 MB).  Gdy nazwy
+    znacznika w pliku nie ma, parsowanie na pewno nic nie da.
+
+    Nazwy spoza ASCII przepuszczamy bez sprawdzania (plik może być w innym
+    kodowaniu niż UTF-8 — lepiej spróbować, niż zgubić dopasowanie).
+    """
+    if not tag:
+        return False
+    try:
+        raw = tag.encode("ascii")
+    except UnicodeEncodeError:
+        return True
+    pattern = rb"<\s*(?:[A-Za-z0-9_.\-]+:)?" + re.escape(raw) + rb"(?=[\s/>])"
+    return re.search(pattern, data) is not None
+
+
 def unify_record_paths(
-    docs: List[xmlflatten.ParsedDoc],
+    docs: List[Any],
     *,
     repeat: str = "join",
     join_sep: str = " | ",
@@ -310,6 +810,10 @@ def unify_record_paths(
     się nie powtarzało.  Gdy ścieżka pasuje — plik dostaje takie same kolumny
     jak reszta.  Gdy nie pasuje — zostaje bez zmian.
 
+    Koszt jest LINIOWY względem liczby plików: bajty czytamy raz, kandydatów
+    odsiewamy tanim przedfiltrem po nazwie znacznika, a i tak próbujemy najwyżej
+    :data:`UNIFY_MAX_CANDIDATES` najczęstszych ścieżek.
+
     Modyfikuje listę ``docs`` w miejscu; zwraca zbiór ścieżek plików, które
     zostały ponownie wczytane.
     """
@@ -326,25 +830,42 @@ def unify_record_paths(
     for index, doc in enumerate(docs):
         if doc.record_path or not os.path.exists(doc.source):
             continue
+        try:
+            with open(doc.source, "rb") as handle:
+                data = handle.read()          # JEDEN odczyt na plik, nie N
+        except (OSError, MemoryError):
+            continue
+        tried = 0
         for candidate in candidates:
+            if not _tag_in_bytes(data, _tag_of(candidate)):
+                continue                      # znacznika nie ma — nie ma czego parsować
+            if tried >= UNIFY_MAX_CANDIDATES:
+                break
+            tried += 1
             try:
-                fresh = xmlflatten.parse_file(
+                fresh = xmlflatten.parse_bytes(
+                    data,
                     doc.source,
                     repeat=repeat,
                     join_sep=join_sep,
                     record_path=candidate,
                     strip_ns=strip_ns,
                 )
-            except (ValueError, OSError):
+            except (ValueError, OSError, MemoryError):
                 continue
             if fresh.record_path and fresh.records:
-                docs[index] = fresh
+                adopt = getattr(doc, "adopt", None)
+                if callable(adopt):
+                    adopt(fresh, candidate)
+                else:                         # ktoś podał gołe ParsedDoc
+                    docs[index] = fresh
                 unified.add(fresh.source)
                 reporter.info(
                     "  ujednolicam kolumny: %s -> ścieżka rekordu %s"
                     % (os.path.basename(doc.source), candidate)
                 )
                 break
+        del data
     return unified
 
 
@@ -353,11 +874,28 @@ def unify_record_paths(
 # --------------------------------------------------------------------------- #
 
 
-def _convert(value: Any, use_typing: bool) -> Any:
-    """Zamienia napis na liczbę/datę/bool, gdy włączone jest rozpoznawanie typów."""
-    if use_typing and isinstance(value, str):
+def _convert(value: Any, use_typing: bool, cache: Optional[dict] = None) -> Any:
+    """Zamienia napis na liczbę/datę/bool, gdy włączone jest rozpoznawanie typów.
+
+    ``cache`` (opcjonalny) pamięta wyniki dla powtarzających się napisów.
+    Rozpoznawanie typów było najdroższym elementem składania wierszy (5 mln
+    wywołań ``coerce_value`` na 150 tys. wierszy), a wartości w kolumnach
+    powtarzają się masowo: grade, stan, jednostki, pola kontekstu powtórzone
+    w każdym wierszu.  Wynik ``coerce_value`` jest niezmienny, więc dzielenie go
+    między komórki jest bezpieczne.
+    """
+    if not (use_typing and isinstance(value, str)):
+        return value
+    if cache is None or len(value) > TYPE_CACHE_MAX_LEN:
         return values.coerce_value(value)
-    return value
+    try:
+        return cache[value]
+    except KeyError:
+        pass
+    result = values.coerce_value(value)
+    if len(cache) < TYPE_CACHE_MAX:
+        cache[value] = result
+    return result
 
 
 def _unique_headers(columns: Sequence[str], reserved: Sequence[str]) -> List[str]:
@@ -383,29 +921,62 @@ def _unique_headers(columns: Sequence[str], reserved: Sequence[str]) -> List[str
 
 
 def _iter_rows(
-    docs: Sequence[xmlflatten.ParsedDoc],
+    docs: Sequence[Any],
     columns: Sequence[str],
     *,
     with_auction: bool,
     use_typing: bool,
+    reporter: Optional[Reporter] = None,
+    failures: Optional[List[str]] = None,
 ) -> Iterator[List[Any]]:
     """Generuje wiersze arkusza: kolumny techniczne + wartości z XML-a.
 
     Świadomie jest to GENERATOR — arkusz może mieć setki tysięcy wierszy,
-    a ``xlsxwrite`` zapisuje strumieniowo.
+    a ``xlsxwrite`` zapisuje strumieniowo.  Dokument jest wczytywany dopiero
+    wtedy, gdy przychodzi jego kolej, i porzucany zaraz po oddaniu wierszy —
+    dzięki temu naraz w pamięci jest najwyżej JEDEN plik.
+
+    ``failures`` (opcjonalna lista) zbiera pliki, których NIE udało się wczytać
+    ponownie w chwili zapisu.  Ich wiersze nie trafią do arkusza, a arkusz
+    ``Podsumowanie`` — zbudowany wcześniej — nadal liczy je jako wczytane;
+    bez tej listy taka rozbieżność byłaby cichą utratą danych.
     """
-    for doc in docs:
-        filename = os.path.basename(doc.source) or doc.source
+    cache: Dict[str, Any] = {}
+    done = 0
+    next_report = PROGRESS_ROWS
+    for handle in docs:
+        filename = os.path.basename(handle.source) or handle.source
+        try:
+            doc = _doc_source(handle)
+        except (ValueError, OSError, MemoryError) as exc:
+            # plik zniknął albo zmienił się w trakcie pracy — lepiej głośno
+            # pominąć jeden plik niż wywrócić cały zapis
+            if failures is not None:
+                failures.append(handle.source)
+            if reporter is not None:
+                reporter.warn(
+                    "Nie udało się ponownie wczytać %s — pomijam jego wiersze (%s)"
+                    % (filename, _short(exc))
+                )
+            continue
+        auction = handle.auction
         for index, raw in enumerate(xmlflatten.rows_for(doc, columns), 1):
-            cells = [_convert(value, use_typing) for value in raw]
+            cells = [_convert(value, use_typing, cache) for value in raw]
+            done += 1
+            if reporter is not None and done >= next_report:
+                # zapis dużego korpusu to najdłuższa faza pracy — pokazujemy,
+                # że postępuje, zamiast milczeć przez kilka minut
+                next_report += PROGRESS_ROWS
+                reporter.info("  ... zapisano %s" % _rows(done))
             if with_auction:
-                yield [doc.auction, filename, index] + cells
+                yield [auction, filename, index] + cells
             else:
                 yield [filename, index] + cells
+        doc = None                     # zwolnij rekordy przed następnym plikiem
 
 
 def _summary_rows(
-    docs: Sequence[xmlflatten.ParsedDoc],
+    docs: Sequence[Any],
     errors: Sequence[Tuple[str, str]],
     column_count: int,
     unified: Sequence[str] = (),
@@ -418,7 +989,7 @@ def _summary_rows(
             [
                 os.path.basename(doc.source) or doc.source,
                 doc.auction,
-                len(doc.records),
+                _doc_count(doc),
                 doc.record_path or "(brak — cały plik jako 1 wiersz)",
                 len(doc.columns),
                 "OK (ścieżka ujednolicona)" if doc.source in unified else "OK",
@@ -435,7 +1006,7 @@ def _summary_rows(
                 "BŁĄD: " + message,
             ]
         )
-    total = sum(len(doc.records) for doc in docs)
+    total = sum(_doc_count(doc) for doc in docs)
     rows.append(
         [
             "RAZEM",
@@ -449,13 +1020,68 @@ def _summary_rows(
     return rows
 
 
+def _make_sheet(name: str, columns: List[str], rows: Any, key_columns: int) -> Sheet:
+    """Buduje ``Sheet``, prosząc o powtórzenie kolumn kluczowych po podziale.
+
+    Gdy kolumn jest więcej niż mieści arkusz Excela, ``xlsxwrite`` dzieli je na
+    bloki.  Bez powtórzenia ``Aukcja``/``Plik``/``Nr pozycji`` wiersza w
+    arkuszu-kontynuacji nie dałoby się przypisać do aukcji inaczej niż po
+    numerze wiersza.  Parametr jest opcjonalny — gdy zapis go nie zna,
+    budujemy arkusz po staremu (kontraktowe ``Sheet(name, columns, rows)``).
+    """
+    try:
+        return Sheet(name=name, columns=columns, rows=rows, key_columns=key_columns)
+    except TypeError:  # pragma: no cover - starsza wersja xlsxwrite
+        return Sheet(name=name, columns=columns, rows=rows)
+
+
+def _auction_sheet_name(auction: str, position: int, used: set) -> str:
+    """Nazwa zakładki dla arkusza jednej aukcji — z ZACHOWANIEM końcówki.
+
+    Identyfikatory aukcji (``flexit-auctions-18-06-2026-1103``) różnią się na
+    KOŃCU, a limit Excela to 31 znaków.  Zwykłe obcięcie od prawej zostawiało
+    same identyczne początki, rozróżniane potem automatycznym ``(2)``, ``(3)``.
+    Dlatego numerujemy arkusze (zgodnie z kolejnością w ``Podsumowaniu``)
+    i skracamy nazwę w ŚRODKU, zostawiając rozpoznawalny ogon.
+    """
+    prefix = "%02d " % position
+    room = getattr(xlsxwrite, "SHEET_NAME_MAX", 31) - len(prefix)
+    label = str(auction or "").strip() or SHEET_ALL
+    if len(label) > room:
+        head = max(1, (room - 1) * 2 // 5)
+        tail = room - 1 - head
+        label = label[:head] + "…" + label[-tail:]
+    return xlsxwrite.safe_sheet_name(prefix + label, used)
+
+
+def collective_table(
+    docs: Sequence[Any],
+    *,
+    use_typing: bool = True,
+    reporter: Optional[Reporter] = None,
+    failures: Optional[List[str]] = None,
+) -> Tuple[List[str], Iterator[List[Any]]]:
+    """Nagłówki i wiersze arkusza zbiorczego — dokładnie to, co arkusz nr 1.
+
+    Wydzielone, bo tę samą tabelę zapisuje też eksport CSV (i ratunkowy zapis,
+    gdy XLSX się nie uda).  Wiersze są GENERATOREM — nie materializujemy ich.
+    """
+    data_columns = xmlflatten.merge_columns(list(docs))
+    headers = TECH_COLUMNS + _unique_headers(data_columns, TECH_COLUMNS)
+    rows = _iter_rows(docs, data_columns, with_auction=True, use_typing=use_typing,
+                      reporter=reporter, failures=failures)
+    return headers, rows
+
+
 def build_sheets(
-    docs: Sequence[xmlflatten.ParsedDoc],
+    docs: Sequence[Any],
     errors: Sequence[Tuple[str, str]] = (),
     *,
     per_auction: bool = False,
     use_typing: bool = True,
     unified: Sequence[str] = (),
+    reporter: Optional[Reporter] = None,
+    failures: Optional[List[str]] = None,
 ) -> List[Sheet]:
     """Składa listę arkuszy do zapisania przez :func:`xlsxwrite.write_workbook`."""
     data_columns = xmlflatten.merge_columns(list(docs))
@@ -463,35 +1089,129 @@ def build_sheets(
 
     used_names: set = set()
     sheets: List[Sheet] = [
-        Sheet(
-            name=xlsxwrite.safe_sheet_name(SHEET_ALL, used_names),
-            columns=TECH_COLUMNS + headers,
-            rows=_iter_rows(docs, data_columns, with_auction=True, use_typing=use_typing),
+        _make_sheet(
+            xlsxwrite.safe_sheet_name(SHEET_ALL, used_names),
+            TECH_COLUMNS + headers,
+            _iter_rows(docs, data_columns, with_auction=True, use_typing=use_typing,
+                       reporter=reporter, failures=failures),
+            len(TECH_COLUMNS),
         ),
-        Sheet(
-            name=xlsxwrite.safe_sheet_name(SHEET_SUMMARY, used_names),
-            columns=list(SUMMARY_COLUMNS),
-            rows=_summary_rows(docs, errors, len(data_columns), unified),
+        _make_sheet(
+            xlsxwrite.safe_sheet_name(SHEET_SUMMARY, used_names),
+            list(SUMMARY_COLUMNS),
+            _summary_rows(docs, errors, len(data_columns), unified),
+            0,
         ),
     ]
 
     if per_auction:
-        groups: Dict[str, List[xmlflatten.ParsedDoc]] = {}
+        groups: Dict[str, List[Any]] = {}
         for doc in docs:
             groups.setdefault(doc.auction, []).append(doc)
-        for auction, group in groups.items():
+        for position, (auction, group) in enumerate(groups.items(), 1):
             own_columns = xmlflatten.merge_columns(group)
             own_headers = _unique_headers(own_columns, TECH_COLUMNS_PER_AUCTION)
             sheets.append(
-                Sheet(
-                    name=xlsxwrite.safe_sheet_name(auction, used_names),
-                    columns=TECH_COLUMNS_PER_AUCTION + own_headers,
-                    rows=_iter_rows(
-                        group, own_columns, with_auction=False, use_typing=use_typing
-                    ),
+                _make_sheet(
+                    _auction_sheet_name(auction, position, used_names),
+                    TECH_COLUMNS_PER_AUCTION + own_headers,
+                    _iter_rows(group, own_columns, with_auction=False,
+                               use_typing=use_typing, reporter=reporter,
+                               failures=failures),
+                    len(TECH_COLUMNS_PER_AUCTION),
                 )
             )
     return sheets
+
+
+# --------------------------------------------------------------------------- #
+# Zapis awaryjny: CSV
+# --------------------------------------------------------------------------- #
+
+
+def _csv_text(value: str) -> str:
+    """Czyści tekst jak :func:`values.sanitize_cell`, ale BEZ obcinania.
+
+    Limit 32767 znaków jest limitem KOMÓRKI Excela — w pliku CSV nie
+    obowiązuje, więc obcinanie byłoby tu bezcelową utratą treści.  Czyszczenie
+    jest znak po znaku, więc dzielenie tekstu na kawałki niczego nie zmienia.
+    """
+    if len(value) <= values.MAX_CELL_CHARS:
+        return values.sanitize_cell(value)
+    step = values.MAX_CELL_CHARS
+    return "".join(values.sanitize_cell(value[i:i + step])
+                   for i in range(0, len(value), step))
+
+
+def _csv_cell(value: Any, decimal_comma: bool) -> str:
+    """Zamienia wartość na tekst do CSV: bez utraty treści i bez formuł.
+
+    * ``None`` -> pusta komórka, ``bool`` -> ``PRAWDA``/``FAŁSZ`` (jak w XLSX),
+    * daty w formacie ISO (jednoznacznym w każdym ustawieniu regionalnym),
+    * przy separatorze ``;`` liczby dostają przecinek dziesiętny — tak Excel
+      w polskiej wersji rozpozna je jako liczby, a nie tekst,
+    * tekst zaczynający się od ``=`` ``+`` ``-`` ``@`` dostaje apostrof.  W CSV
+      nie ma "typu komórki", więc bez tego Excel policzyłby taką wartość jak
+      formułę (klasyczne wstrzyknięcie formuły z pliku z sieci).
+    """
+    value = value if isinstance(value, str) else values.sanitize_cell(value)
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "PRAWDA" if value else "FAŁSZ"
+    if isinstance(value, (int, float)):
+        text = repr(value) if isinstance(value, float) else str(value)
+        return text.replace(".", ",") if decimal_comma else text
+    if isinstance(value, str):
+        text = _csv_text(value)
+        return "'" + text if values.looks_like_formula(text) else text
+    text = values.sanitize_cell(str(value))
+    return "'" + text if values.looks_like_formula(text) else text
+
+
+def write_csv(
+    path,
+    columns: Sequence[str],
+    rows: Iterable[Sequence[Any]],
+    *,
+    sep: str = DEFAULT_CSV_SEP,
+) -> int:
+    """Zapisuje JEDNĄ tabelę do pliku CSV; zwraca liczbę wierszy danych.
+
+    Kodowanie to UTF-8 **z BOM** — dzięki temu Excel otwiera plik z polskimi
+    znakami po dwukliku, bez kreatora importu.  Wiersze mogą być generatorem.
+    """
+    target = os.path.expanduser(os.fspath(path))
+    decimal_comma = sep == ";"
+    width = len(columns)
+    written = 0
+    with open(target, "w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.writer(handle, delimiter=sep, quoting=csv.QUOTE_MINIMAL,
+                            lineterminator="\r\n")
+        writer.writerow([_csv_cell(name, decimal_comma) for name in columns])
+        for row in rows:
+            cells = [_csv_cell(value, decimal_comma) for value in row]
+            if len(cells) < width:
+                cells.extend([""] * (width - len(cells)))
+            writer.writerow(cells)
+            written += 1
+    return written
+
+
+def _free_path(path: str) -> str:
+    """Pierwsza wolna nazwa: ``a.csv``, ``a-2.csv``, ``a-3.csv``…
+
+    Używane TYLKO przy zapisie ratunkowym — tam odmowa ("plik już istnieje")
+    oznaczałaby utratę wszystkiego, co udało się zebrać.
+    """
+    if not os.path.exists(path):
+        return path
+    root, ext = os.path.splitext(path)
+    for counter in range(2, 1000):
+        candidate = "%s-%d%s" % (root, counter, ext)
+        if not os.path.exists(candidate):
+            return candidate
+    return path
 
 
 # --------------------------------------------------------------------------- #
@@ -499,10 +1219,12 @@ def build_sheets(
 # --------------------------------------------------------------------------- #
 
 
-def _prepare_output(path: str, overwrite: bool, reporter: Reporter) -> Optional[str]:
-    """Sprawdza ścieżkę wyniku i tworzy brakujące katalogi.
+def _output_is_writable(path: str, overwrite: bool, reporter: Reporter) -> bool:
+    """Czy wolno zapisać wynik pod tą ścieżką? (sam warunek, bez tworzenia katalogów)
 
-    Zwraca ścieżkę albo ``None``, gdy zapisu nie wolno wykonać.
+    Wydzielone, bo podkomenda ``all`` musi sprawdzić to PRZED pobieraniem —
+    inaczej użytkownik ściąga kilkanaście minut z portalu, żeby na koniec
+    usłyszeć, że plik .xlsx już istnieje.
     """
     target = os.path.expanduser(path)
     if os.path.isdir(target):
@@ -510,12 +1232,24 @@ def _prepare_output(path: str, overwrite: bool, reporter: Reporter) -> Optional[
             "%s to katalog, a potrzebna jest nazwa pliku (np. %s)"
             % (target, os.path.join(target, DEFAULT_XLSX))
         )
-        return None
+        return False
     if os.path.exists(target) and not overwrite:
         reporter.error(
             "Plik %s już istnieje. Dodaj opcję --overwrite, żeby go nadpisać, "
             "albo podaj inną nazwę w --out." % target
         )
+        return False
+    return True
+
+
+def _prepare_output(path: str, overwrite: bool, reporter: Reporter,
+                    suffix: str = ".xlsx") -> Optional[str]:
+    """Sprawdza ścieżkę wyniku i tworzy brakujące katalogi.
+
+    Zwraca ścieżkę albo ``None``, gdy zapisu nie wolno wykonać.
+    """
+    target = os.path.expanduser(path)
+    if not _output_is_writable(path, overwrite, reporter):
         return None
     parent = os.path.dirname(os.path.abspath(target))
     try:
@@ -523,12 +1257,46 @@ def _prepare_output(path: str, overwrite: bool, reporter: Reporter) -> Optional[
     except OSError as exc:
         reporter.error("Nie mogę utworzyć katalogu %s (%s)" % (parent, exc))
         return None
-    if not target.lower().endswith(".xlsx"):
+    if not target.lower().endswith(suffix):
         reporter.warn(
-            "Nazwa %s nie kończy się na .xlsx — Excel może nie skojarzyć pliku."
-            % os.path.basename(target)
+            "Nazwa %s nie kończy się na %s — Excel może nie skojarzyć pliku."
+            % (os.path.basename(target), suffix)
         )
     return target
+
+
+def _handle_duplicates(files: List[str], skip: bool, reporter: Reporter) -> List[str]:
+    """Ostrzega o plikach o identycznej treści (albo je pomija przy ``--skip-duplicates``).
+
+    Zdublowany plik to zdublowane wiersze — a więc zawyżony stan magazynu bez
+    ŻADNEGO widocznego objawu.  Domyślnie tylko mówimy o tym głośno; decyzję
+    zostawiamy użytkownikowi, bo to on wie, czy dwie kopie są przypadkiem.
+    """
+    duplicates = find_duplicate_files(files)
+    if not duplicates:
+        return files
+    if skip:
+        reporter.info(
+            "Pomijam %s o treści identycznej z innymi (opcja --skip-duplicates)."
+            % _files(len(duplicates))
+        )
+        for path in sorted(duplicates):
+            reporter.info("  duplikat: %s = %s"
+                          % (os.path.basename(path),
+                             os.path.basename(duplicates[path])))
+        return [path for path in files if path not in duplicates]
+    reporter.warn(
+        "%s treść identyczną z innym plikiem — te same pozycje policzą się "
+        "DWA razy. Dodaj --skip-duplicates, żeby je pominąć."
+        % _plural(len(duplicates), "plik ma", "pliki mają", "plików ma")
+    )
+    for number, path in enumerate(sorted(duplicates)):
+        if number == 5:
+            reporter.warn("  ... oraz %d dalszych" % (len(duplicates) - 5))
+            break
+        reporter.warn("  %s = %s" % (os.path.basename(path),
+                                     os.path.basename(duplicates[path])))
+    return files
 
 
 def cmd_build(args: argparse.Namespace, reporter: Reporter) -> int:
@@ -553,6 +1321,8 @@ def cmd_build(args: argparse.Namespace, reporter: Reporter) -> int:
             % ", ".join(inputs)
         )
         return EXIT_NO_DATA
+
+    files = _handle_duplicates(files, getattr(args, "skip_duplicates", False), reporter)
 
     reporter.step("Wczytuję %s XML" % _files(len(files)))
     docs, errors = load_documents(
@@ -580,7 +1350,7 @@ def cmd_build(args: argparse.Namespace, reporter: Reporter) -> int:
             reporter=reporter,
         )
 
-    total_rows = sum(len(doc.records) for doc in docs)
+    total_rows = sum(_doc_count(doc) for doc in docs)
     data_columns = xmlflatten.merge_columns(docs)
     auctions = sorted({doc.auction for doc in docs})
 
@@ -600,6 +1370,8 @@ def cmd_build(args: argparse.Namespace, reporter: Reporter) -> int:
         if args.per_auction:
             for number, auction in enumerate(auctions, 3):
                 reporter.info("  %d. %s" % (number, auction))
+        if getattr(args, "csv", None):
+            reporter.info("Dodatkowo plik CSV: %s" % args.csv)
         reporter.info("Kolumny: " + ", ".join(TECH_COLUMNS + list(data_columns[:20])))
         if len(data_columns) > 20:
             reporter.info("  ... oraz %d dalszych" % (len(data_columns) - 20))
@@ -617,24 +1389,90 @@ def cmd_build(args: argparse.Namespace, reporter: Reporter) -> int:
     if target is None:
         return EXIT_ERROR
 
+    # Ścieżkę CSV sprawdzamy PRZED zapisem XLSX — żeby nie okazało się po
+    # wszystkim, że dodatkowego pliku i tak nie wolno zapisać.
+    csv_target: Optional[str] = None
+    csv_sep = getattr(args, "csv_sep", DEFAULT_CSV_SEP) or DEFAULT_CSV_SEP
+    if getattr(args, "csv", None):
+        csv_target = _prepare_output(args.csv, args.overwrite, reporter, ".csv")
+        if csv_target is None:
+            return EXIT_ERROR
+
+    lost: List[str] = []
     sheets = build_sheets(
         docs,
         errors,
         per_auction=args.per_auction,
         use_typing=not args.no_typing,
         unified=unified,
+        reporter=reporter,
+        failures=lost,
     )
+    reporter.step("Zapisuję %s" % os.path.abspath(target))
     try:
         xlsxwrite.write_workbook(target, sheets)
-    except OSError as exc:
-        reporter.error("Nie udało się zapisać %s (%s)" % (target, exc))
+    except (OSError, MemoryError, ValueError) as exc:
+        if isinstance(exc, MemoryError):
+            reporter.error(
+                "Za mało pamięci przy zapisie %s. Spróbuj podzielić katalog na "
+                "części (--limit), pominąć --per-auction albo ograniczyć kolumny "
+                "opcją --record-path." % target
+            )
+        else:
+            reporter.error("Nie udało się zapisać %s — %s" % (target, _short(exc)))
+        # Ratunek: dane są już wczytane, więc zamiast odejść z pustymi rękami
+        # zapisujemy je w formacie, który poradzi sobie zawsze.
+        _rescue_to_csv(docs, target, csv_sep, not args.no_typing, reporter)
         return EXIT_ERROR
 
     reporter.step(
         "Zapisano %s (zapis: %s)" % (os.path.abspath(target), xlsxwrite.backend_name())
     )
+
+    if csv_target is not None:
+        columns, rows = collective_table(
+            docs, use_typing=not args.no_typing, reporter=reporter)
+        try:
+            count = write_csv(csv_target, columns, rows, sep=csv_sep)
+        except (OSError, ValueError, MemoryError) as exc:
+            reporter.error("Nie udało się zapisać %s — %s" % (csv_target, _short(exc)))
+            return EXIT_ERROR
+        reporter.step("Zapisano %s (%s, separator '%s')"
+                      % (os.path.abspath(csv_target), _rows(count), csv_sep))
+
     _report_errors(errors, reporter)
+    if lost:
+        reporter.warn(
+            "UWAGA na dane: %s nie dało się wczytać ponownie w chwili zapisu, "
+            "więc ich wiersze NIE trafiły do arkusza (arkusz %s liczy je jako "
+            "wczytane). Uruchom program ponownie na nieruszanym katalogu."
+            % (_files(len(set(lost))), SHEET_SUMMARY)
+        )
+        return EXIT_PARTIAL
     return EXIT_PARTIAL if errors else EXIT_OK
+
+
+def _rescue_to_csv(docs: Sequence[Any], target: str, sep: str,
+                   use_typing: bool, reporter: Reporter) -> None:
+    """Ostatnia deska ratunku: zapisuje zebrane dane do CSV, gdy XLSX padł.
+
+    Bez tego nieudany zapis (brak miejsca, plik zablokowany przez otwarty
+    Excel, błąd w generatorze OOXML) oznaczał dla użytkownika stratę CAŁEJ
+    pracy — łącznie z godzinami pobierania.  CSV nie ma limitów Excela i
+    powstaje z tych samych wierszy, co arkusz zbiorczy.
+    """
+    fallback = _free_path(os.path.splitext(target)[0] + ".csv")
+    try:
+        columns, rows = collective_table(docs, use_typing=use_typing, reporter=None)
+        count = write_csv(fallback, columns, rows, sep=sep)
+    except (OSError, ValueError, MemoryError) as exc:
+        reporter.error("Nie udało się nawet ratunkowe CSV (%s)" % _short(exc))
+        return
+    reporter.warn(
+        "Dane uratowane do %s (%s). Excel otworzy ten plik dwuklikiem; "
+        "w razie potrzeby: Dane -> Z pliku tekstowego/CSV, separator '%s'."
+        % (os.path.abspath(fallback), _rows(count), sep)
+    )
 
 
 def _report_errors(errors: Sequence[Tuple[str, str]], reporter: Reporter) -> None:
@@ -700,15 +1538,19 @@ def cmd_download(args: argparse.Namespace, reporter: Reporter) -> int:
             reporter.error("Nie mogę utworzyć katalogu %s (%s)" % (out_dir, exc))
             return EXIT_ERROR
 
-    opener = scrape.make_opener(
-        cookie=args.cookie,
-        timeout=args.timeout,
-        retries=args.retries,
-        delay=args.delay,
-        diagnose=args.diagnose,
-    )
-    if args.user_agent:
-        opener.user_agent = args.user_agent
+    try:
+        opener = scrape.make_opener(
+            cookie=args.cookie,
+            user_agent=args.user_agent or scrape.DEFAULT_USER_AGENT,
+            timeout=args.timeout,
+            retries=args.retries,
+            delay=args.delay,
+            diagnose=args.diagnose,
+        )
+    except scrape.ScrapeError as exc:
+        # np. ciasteczko wklejone razem ze znakiem końca linii
+        reporter.error(_short(exc))
+        return EXIT_ERROR
 
     reporter.step("Szukam aukcji na %s" % args.base_url)
     try:
@@ -818,6 +1660,17 @@ def cmd_download(args: argparse.Namespace, reporter: Reporter) -> int:
 
 def cmd_all(args: argparse.Namespace, reporter: Reporter) -> int:
     """Pobiera XML-e, a potem od razu buduje z nich plik XLSX."""
+    # Warunek "plik wynikowy już istnieje" znamy PRZED pierwszym żądaniem HTTP.
+    # Bez tej kontroli użytkownik pobierał setki lotów (z uprzejmym --delay),
+    # żeby na końcu usłyszeć "dodaj --overwrite" i zacząć od nowa.
+    if not args.dry_run and not _output_is_writable(args.out, args.overwrite, reporter):
+        reporter.error("Nie zaczynam pobierania — najpierw popraw --out.")
+        return EXIT_ERROR
+    if (not args.dry_run and getattr(args, "csv", None)
+            and not _output_is_writable(args.csv, args.overwrite, reporter)):
+        reporter.error("Nie zaczynam pobierania — najpierw popraw --csv.")
+        return EXIT_ERROR
+
     download_args = argparse.Namespace(**vars(args))
     download_args.out = args.xml_dir
     code_download = cmd_download(download_args, reporter)
@@ -855,8 +1708,96 @@ def cmd_all(args: argparse.Namespace, reporter: Reporter) -> int:
 # --------------------------------------------------------------------------- #
 
 
+def _polish_argparse_error(message: str) -> str:
+    """Tłumaczy komunikat składniowy argparse na polski.
+
+    README obiecuje "pomoc po polsku", a to właśnie te komunikaty widzi
+    użytkownik w chwili pomyłki — czyli dokładnie wtedy, gdy pomoc jest
+    najbardziej potrzebna.  Nieznanych wzorców nie kaleczymy: wracają bez zmian.
+    """
+    match = re.match(r"^argument (?P<what>.+?): invalid choice: (?P<value>.+?) "
+                     r"\(choose from (?P<opts>.+)\)$", message)
+    if match:
+        opts = match.group("opts").replace("'", "")
+        if match.group("what").strip().lower() == "podkomenda":
+            return ("nieznana podkomenda: %s — dostępne: %s"
+                    % (match.group("value"), opts))
+        return ("nieznana wartość %s dla %s — dostępne: %s"
+                % (match.group("value"), match.group("what"), opts))
+    match = re.match(r"^unrecognized arguments: (?P<rest>.+)$", message)
+    if match:
+        return ("nierozpoznany argument: %s — sprawdź pisownię "
+                "(pełna lista opcji: --help)" % match.group("rest"))
+    match = re.match(r"^the following arguments are required: (?P<rest>.+)$", message)
+    if match:
+        return "brakuje wymaganego argumentu: %s" % match.group("rest")
+    match = re.match(r"^argument (?P<what>.+?): expected one argument$", message)
+    if match:
+        return "opcja %s wymaga podania wartości" % match.group("what")
+    match = re.match(r"^argument (?P<what>.+?): expected at least one argument$", message)
+    if match:
+        return "opcja %s wymaga co najmniej jednej wartości" % match.group("what")
+    match = re.match(r"^argument (?P<what>.+?): invalid (?P<kind>\w+) value: "
+                     r"(?P<value>.+)$", message)
+    if match:
+        kinds = {"int": "liczbą całkowitą", "float": "liczbą"}
+        opis = kinds.get(match.group("kind"), "wartością typu " + match.group("kind"))
+        return ("wartość %s dla %s nie jest %s"
+                % (match.group("value"), match.group("what"), opis))
+    match = re.match(r"^ambiguous option: (?P<rest>.+)$", message)
+    if match:
+        return "niejednoznaczny skrót opcji: %s" % match.group("rest")
+    if message == "too few arguments":  # pragma: no cover - starsze Pythony
+        return "za mało argumentów"
+    return message
+
+
+def _polish_headers(text: str) -> str:
+    """Podmienia angielskie resztki szkieletu argparse na polskie."""
+    return (text
+            .replace("usage: ", "użycie: ")
+            .replace("positional arguments:", "argumenty pozycyjne:")
+            .replace("options:", "opcje:")
+            .replace("optional arguments:", "opcje:"))
+
+
+class PolishArgumentParser(argparse.ArgumentParser):
+    """``ArgumentParser`` mówiący po polsku — także przy błędach składni.
+
+    Sam argparse ma szkielet po angielsku ("positional arguments", "options",
+    "invalid choice", "unrecognized arguments") i nie da się go przetłumaczyć
+    parametrem.  Podmieniamy więc tytuły grup, własną opcję ``--help`` oraz
+    :meth:`error`.  Podparsery dziedziczą tę klasę automatycznie
+    (``add_subparsers`` bierze ``parser_class = type(self)``).
+    """
+
+    def __init__(self, *args, **kwargs):
+        with_help = kwargs.pop("add_help", True)
+        kwargs["add_help"] = False
+        super().__init__(*args, **kwargs)
+        self._positionals.title = "argumenty pozycyjne"
+        self._optionals.title = "opcje"
+        if with_help:
+            self.add_argument("-h", "--help", action="help",
+                              help="pokaż tę pomoc i zakończ")
+
+    def format_usage(self) -> str:  # noqa: D102
+        return _polish_headers(super().format_usage())
+
+    def format_help(self) -> str:  # noqa: D102
+        return _polish_headers(super().format_help())
+
+    def error(self, message: str):  # noqa: D102
+        self.print_usage(sys.stderr)
+        self.exit(EXIT_USAGE,
+                  "%s: błąd: %s\n" % (self.prog, _polish_argparse_error(message)))
+
+
 def _add_common(parser: argparse.ArgumentParser) -> None:
     """Opcje wspólne dla wszystkich podkomend."""
+    parser.add_argument("--version", action="version",
+                        version="%s %s" % (PROG, _version()),
+                        help="pokaż numer wersji i zakończ")
     parser.add_argument("--quiet", "-q", action="store_true",
                         help="mniej komunikatów (błędy nadal widoczne)")
     parser.add_argument("--dry-run", action="store_true",
@@ -895,7 +1836,9 @@ def _add_download_options(parser: argparse.ArgumentParser) -> None:
     group.add_argument("--delay", type=float, default=0.5, metavar="SEKUNDY",
                        help="uprzejma przerwa między żądaniami (domyślnie %(default)s)")
     group.add_argument("--timeout", type=float, default=30.0, metavar="SEKUNDY",
-                       help="limit czasu jednego żądania (domyślnie %(default)s)")
+                       help="limit czasu jednej operacji na gnieździe; cała "
+                            "odpowiedź ma na siebie dziesięciokrotność tego "
+                            "czasu (domyślnie %(default)s)")
     group.add_argument("--retries", type=int, default=4, metavar="N",
                        help="ile razy ponowić nieudane żądanie (domyślnie %(default)s)")
     group.add_argument("--user-agent", default=None, metavar="TEKST",
@@ -926,11 +1869,22 @@ def _add_build_options(parser: argparse.ArgumentParser) -> None:
                             "kolumny jak pliki z wieloma)")
     group.add_argument("--no-typing", action="store_true",
                        help="nie zamieniaj tekstu na liczby/daty — wszystko jako tekst")
+    group.add_argument("--skip-duplicates", action="store_true",
+                       help="pomiń pliki o treści identycznej z innym plikiem "
+                            "(ten sam pakiet pobrany dwa razy); domyślnie tylko "
+                            "ostrzeżenie")
+    group.add_argument("--csv", default=None, metavar="PLIK",
+                       help="zapisz DODATKOWO arkusz zbiorczy do pliku CSV "
+                            "(UTF-8 z BOM; przydatne, gdy .xlsx nie chce się "
+                            "otworzyć albo dane idą do innego programu)")
+    group.add_argument("--csv-sep", default=DEFAULT_CSV_SEP, metavar="ZNAK",
+                       help="separator pól w CSV (domyślnie '%(default)s' — tak "
+                            "czyta polski Excel; użyj ',' dla wersji angielskiej)")
 
 
 def build_parser() -> argparse.ArgumentParser:
     """Buduje parser argumentów wiersza poleceń."""
-    parser = argparse.ArgumentParser(
+    parser = PolishArgumentParser(
         prog=PROG,
         description="Pobiera pliki XML z portalu flexitauctions.com i scala je "
                     "w JEDEN plik .xlsx.",
@@ -941,7 +1895,8 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--version", action="version",
-                        version="%(prog)s " + _version())
+                        version="%s %s" % (PROG, _version()),
+                        help="pokaż numer wersji i zakończ")
     subparsers = parser.add_subparsers(dest="command", metavar="PODKOMENDA")
 
     # --- download ---------------------------------------------------------
@@ -1030,6 +1985,22 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return EXIT_INTERRUPTED
     except BrokenPipeError:  # pragma: no cover - np. `| head`
         return EXIT_OK
+    except MemoryError:
+        # UWAGA: przy braku pamięci nie składamy długich napisów
+        reporter.error(
+            "Za mało pamięci. Podziel katalog na części, użyj --limit, "
+            "pomiń --per-auction albo wskaż --record-path."
+        )
+        return EXIT_ERROR
+    except Exception as exc:  # ostatnia siatka bezpieczeństwa
+        # Użytkownik tego narzędzia nie ma czytać tracebacku — dostaje zdanie
+        # po polsku i zdefiniowany kod wyjścia.
+        reporter.error("Nieoczekiwany błąd: %s: %s" % (type(exc).__name__, _short(exc)))
+        reporter.error(
+            "Jeśli błąd się powtarza, uruchom polecenie ponownie z opcją --diagnose "
+            "i zachowaj wypisany raport."
+        )
+        return EXIT_ERROR
 
 
 if __name__ == "__main__":  # pragma: no cover

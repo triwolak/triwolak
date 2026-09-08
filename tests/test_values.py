@@ -142,11 +142,11 @@ class TestCoerceFloat(unittest.TestCase):
         ("2,71828", 2.71828),
         ("-1 000,01", -1000.01),
         ("999,99", 999.99),
-        # Udokumentowana reguła: pojedynczy przecinek = separator dziesiętny.
-        ("1,234", 1.234),
-        ("12,345", 12.345),
-        # Pojedyncza kropka = separator dziesiętny.
-        ("1.234", 1.234),
+        # Jednoznaczne mimo trzech cyfr po separatorze: wiodące zero i część
+        # całkowita dłuższa niż trzy cyfry wykluczają odczyt "tysiące".
+        ("0,500", 0.5),
+        ("1234,567", 1234.567),
+        ("0.500", 0.5),
     ]
 
     def test_table(self):
@@ -156,10 +156,24 @@ class TestCoerceFloat(unittest.TestCase):
                 self.assertIsInstance(value, float)
                 self.assertAlmostEqual(value, expected, places=9)
 
-    def test_regula_pojedynczego_przecinka_jest_udokumentowana(self):
-        """"1,234" -> 1.234 (a NIE 1234) — reguła opisana w docstringu modułu."""
-        self.assertAlmostEqual(coerce_value("1,234"), 1.234, places=9)
+    def test_REGRESJA_niejednoznaczny_tysiac_zostaje_tekstem(self):
+        """"1,234" może znaczyć 1234 (EN) albo 1.234 (PL) — zostaje tekstem.
+
+        Wcześniej przecinek był ZAWSZE separatorem dziesiętnym, więc kwota
+        "1,234" z anglojęzycznego portalu trafiała do arkusza jako 1.234,
+        czyli TYSIĄC RAZY mniejsza — bez żadnego ostrzeżenia.
+        """
+        for source in ("1,234", "1,500", "12,345", "123,456", "2,500",
+                       "1.234", "1.500", "12.345", "-1,234", "-1.234"):
+            with self.subTest(source=source):
+                self.assertEqual(coerce_value(source), source)
+        # Zapisy jednoznaczne nadal są liczbami:
         self.assertEqual(coerce_value("1,234,567"), 1234567)
+        self.assertEqual(coerce_value("1.234.567"), 1234567)
+        self.assertAlmostEqual(coerce_value("1 234,56"), 1234.56, places=9)
+        self.assertAlmostEqual(coerce_value("1,234.56"), 1234.56, places=9)
+        self.assertAlmostEqual(coerce_value("1,50"), 1.5, places=9)
+        self.assertEqual(coerce_value("1 234"), 1234)
 
 
 class TestCoerceZostajeTekstem(unittest.TestCase):
@@ -364,6 +378,12 @@ class TestSanitizeCell(unittest.TestCase):
         ("\x00\x01\x02", ""),
         ("a￾b", "ab"),
         ("a￿b", "ab"),
+        # Znaki sterujące C1 – w komórce nie niosą treści, a trafiają tam
+        # ze ŹLE ZDEKODOWANYCH bajtów (mojibake typu "zaĹźĂłĹ\x82Ä\x87").
+        ("a\x80b", "ab"),
+        ("a\x82b", "ab"),
+        ("a\x9fb", "ab"),
+        ("zaĹźĂłĹ\x82Ä\x87", "zaĹźĂłĹÄ"),
     ]
 
     ZNAKI_DO_ZACHOWANIA = [
@@ -373,7 +393,7 @@ class TestSanitizeCell(unittest.TestCase):
         "a\r\nb",
         POLSKIE,
         "🐍💾",
-        "a\x7fb",       # DEL jest dozwolony w XML 1.0
+        "a\x7fb",       # DEL jest legalny w XML 1.0 i musi zostać
         "=SUMA(A1)",
     ]
 

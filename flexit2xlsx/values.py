@@ -7,14 +7,18 @@ dlatego w razie jakiejkolwiek wątpliwości wartość pozostaje TEKSTEM.
 
 Podjęte decyzje projektowe (przypadki niejednoznaczne)
 -----------------------------------------------------
-* ``"1,234"`` -> ``1.234`` (float).  Pojedynczy przecinek jest ZAWSZE traktowany
-  jako separator dziesiętny.  Portal i użytkownik są polskojęzyczni, a w polskiej
-  konwencji separatorem tysięcy jest spacja (albo kropka), nigdy przecinek.
-  Przecinek jako separator tysięcy jest rozpoznawany dopiero, gdy występuje
-  wielokrotnie i tworzy poprawne grupy: ``"1,234,567"`` -> ``1234567``.
-* Pojedyncza kropka jest zawsze separatorem dziesiętnym: ``"1.234"`` -> ``1.234``.
-  Kropka jako separator tysięcy wymaga poprawnego grupowania i co najmniej dwóch
-  wystąpień: ``"1.234.567"`` -> ``1234567``.
+* ``"1,234"`` i ``"1.234"`` zostają TEKSTEM.  Pojedynczy separator z dokładnie
+  TRZEMA cyframi po nim (a przed nim 1-3 cyfry bez wiodącego zera) jest
+  nierozstrzygalny: po angielsku (portal jest anglojęzyczny) to ``1234``, po
+  polsku ``1.234``.  Obie interpretacje różnią się TYSIĄCKROTNIE, więc zamiast
+  zgadywać zostawiamy oryginalny napis — arkusz nigdy nie pokaże kwoty
+  zaniżonej 1000 razy.  Nie dotyczy to zapisów jednoznacznych:
+  ``"1,50"`` -> ``1.5``, ``"0,500"`` -> ``0.5``, ``"1234,567"`` -> ``1234.567``,
+  ``"1,234,567"`` -> ``1234567``, ``"1.234,56"`` -> ``1234.56``.
+* Pojedynczy przecinek/kropka w pozostałych układach jest separatorem
+  dziesiętnym (``"1,5"`` -> ``1.5``); separator tysięcy jest rozpoznawany, gdy
+  występuje wielokrotnie i tworzy poprawne grupy (``"1.234.567"`` -> ``1234567``)
+  albo gdy jest nim spacja (``"1 234,56"`` -> ``1234.56``).
 * Wiodące zero blokuje konwersję: ``"007"``, ``"0012"``, ``"00"`` zostają tekstem
   (numery katalogowe, kody, numery kierunkowe).  ``"0"`` i ``"0,5"`` są liczbami.
 * Wiodący plus NIE jest konwertowany (``"+48 123 456 789"`` to numer telefonu).
@@ -67,8 +71,12 @@ MAX_SCALAR_LEN = 64
 _GROUP_SPACES = "\u00a0\u2007\u2009\u202f\u2008\u2002\u2003\u205f"
 
 #: Znaki niedozwolone w pliku XLSX (poza \t \n \r) + surogaty + nie-znaki.
+#: Zakres ``\x80-\x9f`` (znaki sterujące C1) też jest usuwany: w komórce
+#: arkusza nie niesie żadnej treści, a trafia tam typowo ze ŹLE ZDEKODOWANYCH
+#: bajtów (mojibake typu ``zaĹźĂłĹ\x82Ä\x87``); XML 1.1 wymagałby ich
+#: eskejpowania.  ``\x7f`` (DEL) zostaje – jest legalny w XML 1.0.
 _ILLEGAL_XLSX_RE = re.compile(
-    "[\x00-\x08\x0b\x0c\x0e-\x1f\ud800-\udfff\ufffe\uffff]"
+    "[\\x00-\\x08\\x0b\\x0c\\x0e-\\x1f\\x80-\\x9f\\ud800-\\udfff\\ufffe\\uffff]"
 )
 
 _DIGITS_RE = re.compile(r"[0-9]+")
@@ -140,6 +148,22 @@ def _looks_like_ipv4(text: str) -> bool:
     return all(int(group) <= 255 for group in match.groups())
 
 
+def _is_ambiguous_thousands(digits: str, frac_part, group_sep) -> bool:
+    """True dla zapisów typu ``"1,234"``/``"1.234"`` — nie wiadomo, co znaczą.
+
+    Warunki: jeden separator (``,`` albo ``.``), dokładnie trzy cyfry po nim,
+    część całkowita to 1-3 cyfry bez wiodącego zera i bez separatora grup.
+    Wtedy zapis jest poprawnym tysiącem po angielsku (``1234``) i poprawnym
+    ułamkiem po polsku (``1.234``) — różnica jest 1000-krotna, więc wartość
+    zostaje TEKSTEM zamiast zostać zgadnięta.
+    """
+    if frac_part is None or group_sep is not None:
+        return False
+    if len(frac_part) != 3 or not _all_digits(frac_part):
+        return False
+    return 1 <= len(digits) <= 3 and digits[0] != "0"
+
+
 def _parse_number(text: str):
     """Próbuje zinterpretować tekst jako ``int``/``float``; ``None`` = to nie liczba."""
     body = text.replace("−", "-")  # matematyczny minus
@@ -199,6 +223,9 @@ def _parse_number(text: str):
         return None
     if len(digits) > 1 and digits[0] == "0":
         return None  # numer katalogowy / kod, np. "007"
+
+    if _is_ambiguous_thousands(digits, frac_part, group_sep):
+        return None  # "1,234" / "1.234" – patrz docstring modułu
 
     if frac_part is None:
         if len(digits) > MAX_INT_DIGITS:
@@ -353,8 +380,10 @@ def sanitize_cell(value: Any) -> Any:
     * ``bool``/``int``/``float`` przechodzą bez zmian (NaN/Inf -> tekst),
     * data z offsetem strefy jest sprowadzana do UTC i pozbawiana ``tzinfo``
       (XLSX nie zna stref czasowych),
-    * tekst traci znaki sterujące (poza ``\\t``, ``\\n``, ``\\r``), samotne surogaty
-      i nie-znaki Unicode, a następnie jest przycinany do 32767 znaków,
+    * tekst traci znaki sterujące (poza ``\\t``, ``\\n``, ``\\r``) — w tym DEL
+      i zakres C1 (``\\x7f``-``\\x9f``), typowy dla źle zdekodowanych bajtów —
+      samotne surogaty i nie-znaki Unicode, a następnie jest przycinany do
+      32767 znaków,
     * pozostałe typy są zamieniane na tekst.
 
     Funkcja **nie** dodaje apostrofu — ochroną przed wstrzyknięciem formuły

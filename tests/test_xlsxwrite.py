@@ -178,6 +178,52 @@ class TestSafeSheetName(unittest.TestCase):
     def test_apostrofy_na_brzegach_usuwane(self):
         self.assertEqual(safe_sheet_name("'Dane'", set()), "Dane")
 
+    # -- regresje: nazwa arkusza a poprawność XML-a ------------------------- #
+
+    def test_regresja_apostrof_po_skroceniu_do_31_znakow(self):
+        """Apostrof z ŚRODKA nazwy nie może wylądować na jej końcu po przycięciu.
+
+        Excel nie przyjmuje nazwy zaczynającej się ani kończącej apostrofem,
+        a przycinanie do 31 znaków odbywa się PO pierwszym oczyszczeniu brzegów.
+        """
+        wynik = safe_sheet_name("a" * 30 + "'" + "bcdef", set())
+        self.assertFalse(wynik.endswith("'"), repr(wynik))
+        self.assertFalse(wynik.startswith("'"), repr(wynik))
+        self.assertEqual(wynik, "a" * 30)
+        self.assertLessEqual(len(wynik), 31)
+
+    def test_regresja_apostrof_na_koncu_podstawy_duplikatu(self):
+        """To samo dotyczy podstawy skracanej pod przyrostek „ (2)”."""
+        used = set()
+        raw = "b" * 26 + "'" + "cdefgh"
+        pierwsza = safe_sheet_name(raw, used)
+        druga = safe_sheet_name(raw, used)
+        self.assertFalse(pierwsza.endswith("'"), repr(pierwsza))
+        self.assertFalse(druga.replace(" (2)", "").endswith("'"), repr(druga))
+        self.assertTrue(druga.endswith(" (2)"))
+        self.assertLessEqual(len(druga), 31)
+
+    def test_regresja_znaki_nielegalne_w_xml_usuwane(self):
+        """U+FFFE/U+FFFF i samotne surogaty muszą zniknąć z nazwy arkusza.
+
+        Znaki te są legalne w NAZWIE PLIKU (surogaty pojawiają się przy
+        dekodowaniu nazw spoza UTF-8 przez ``surrogateescape``), ale zabronione
+        w dokumencie XML — wcześniej dawały uszkodzony ``xl/workbook.xml``
+        albo ``UnicodeEncodeError`` z wnętrza ``zipfile``.
+        """
+        przypadki = [
+            ("aukcja ￾ 1", "aukcja 1"),
+            ("aukcja ￿ 1", "aukcja 1"),
+            ("aukcja \udcb3 1", "aukcja 1"),
+            ("\udcb3\udcf3d\udcbc", "d"),          # 'łódź' zapisane w cp1250
+        ]
+        for raw, oczekiwane in przypadki:
+            with self.subTest(raw=repr(raw)):
+                nazwa = safe_sheet_name(raw, set())
+                self.assertEqual(nazwa, oczekiwane)
+                # Nazwa MUSI dać się zapisać w UTF-8 (inaczej wywali się zipfile).
+                nazwa.encode("utf-8")
+
     def test_nazwa_zarezerwowana(self):
         self.assertEqual(safe_sheet_name("History", set()), "History_")
         self.assertEqual(safe_sheet_name("history", set()), "history_")
@@ -772,12 +818,35 @@ class _BackendCase:
 
     # -- zapis pliku -------------------------------------------------------- #
 
-    def test_zapis_jest_powtarzalny_bajt_w_bajt(self):
+    def test_zapis_jest_powtarzalny(self):
+        """Dwa zapisy tych samych danych dają ten sam plik.
+
+        Wbudowany zapis gwarantuje to CO DO BAJTU (stałe znaczniki czasu w ZIP-ie).
+        openpyxl stempluje bieżącą godziną wpisy archiwum i pole
+        ``dcterms:modified`` w ``docProps/core.xml`` — tego nie da się wyłączyć —
+        więc tam porównujemy treść wszystkich części Z DANYMI.  Wcześniej test
+        był losowo czerwony: wystarczyło, że oba zapisy trafiły w różne sekundy.
+        """
         first = self.write([Sheet(name="D", columns=["a"], rows=[["x"]])], name="a.xlsx")
         time.sleep(0.01)
         second = self.write([Sheet(name="D", columns=["a"], rows=[["x"]])], name="b.xlsx")
-        with open(first, "rb") as handle_a, open(second, "rb") as handle_b:
-            self.assertEqual(handle_a.read(), handle_b.read())
+
+        if self.BACKEND == "stdlib":
+            with open(first, "rb") as handle_a, open(second, "rb") as handle_b:
+                self.assertEqual(handle_a.read(), handle_b.read())
+            with zipfile.ZipFile(first) as archive:
+                self.assertEqual(
+                    {info.date_time for info in archive.infolist()}, {(1980, 1, 1, 0, 0, 0)}
+                )
+            return
+
+        with zipfile.ZipFile(first) as a, zipfile.ZipFile(second) as b:
+            self.assertEqual(a.namelist(), b.namelist())
+            for name in a.namelist():
+                if name == "docProps/core.xml":  # tu openpyxl wpisuje czas zapisu
+                    continue
+                with self.subTest(part=name):
+                    self.assertEqual(a.read(name), b.read(name))
 
     def test_nadpisanie_istniejacego_pliku(self):
         path = self.write([Sheet(name="D", columns=["a"], rows=[["stare"]])])
@@ -807,6 +876,167 @@ class _BackendCase:
         write_workbook(target, [Sheet(name="D", columns=["a"], rows=[["x"]])])
         self.assertTrue(target.exists())
         self.assertEqual(openpyxl.load_workbook(target).active["A2"].value, "x")
+
+    # -- regresje ----------------------------------------------------------- #
+
+    def test_regresja_naglowek_przechodzi_przez_sanitize_cell(self):
+        """Nazwa kolumny pochodzi z danych XML — musi być odkażana jak wartość.
+
+        Wcześniej ścieżka stdlib wpisywała surowy ``\\x0b`` (plik nie do otwarcia),
+        a openpyxl rzucał ``IllegalCharacterError``.
+        """
+        path = self.write(
+            [Sheet(name="S", columns=["kol\x0bumna", "b\x00c"], rows=[["x", "y"]])]
+        )
+        with zipfile.ZipFile(path) as archive:
+            raw = archive.read("xl/worksheets/sheet1.xml")
+        self.assertNotIn(b"\x0b", raw)
+        ET.fromstring(raw)  # plik musi być poprawnym XML-em
+        worksheet = openpyxl.load_workbook(path)["S"]
+        self.assertEqual([cell.value for cell in worksheet[1]], ["kolumna", "bc"])
+
+    def test_regresja_naglowek_z_surogatem_nie_wywala_zapisu(self):
+        """Samotny surogat w nazwie kolumny nie może dać ``UnicodeEncodeError``."""
+        path = self.write([Sheet(name="S", columns=["kol\udcb3umna"], rows=[["x"]])])
+        worksheet = openpyxl.load_workbook(path)["S"]
+        self.assertEqual(worksheet["A1"].value, "kolumna")
+
+    def test_regresja_naglowek_dluzszy_niz_limit_jest_przycinany(self):
+        """Nagłówek dłuższy niż 32767 znaków łamał limit Excela w ścieżce stdlib."""
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            path = self.write(
+                [Sheet(name="S", columns=["A" * 40000, "b"], rows=[["x", "y"]])]
+            )
+        worksheet = openpyxl.load_workbook(path)["S"]
+        self.assertEqual(len(worksheet["A1"].value), MAX_CELL_CHARS)
+        with zipfile.ZipFile(path) as archive:
+            raw = archive.read("xl/worksheets/sheet1.xml").decode("utf-8")
+        self.assertNotIn("A" * (MAX_CELL_CHARS + 1), raw)
+        self.assertIn("skrócono", stderr.getvalue())
+
+    def test_regresja_skrocona_komorka_jest_zglaszana_na_stderr(self):
+        """Utrata treści (limit Excela) nigdy nie może być cicha."""
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            path = self.write([Sheet(name="S", columns=["opis"], rows=[["A" * 40000]])])
+        message = stderr.getvalue()
+        self.assertIn("skrócono", message)
+        self.assertIn(str(MAX_CELL_CHARS), message)
+        self.assertEqual(
+            len(openpyxl.load_workbook(path)["S"]["A2"].value), MAX_CELL_CHARS
+        )
+
+    def test_regresja_nazwa_arkusza_z_nielegalnym_znakiem_daje_poprawny_plik(self):
+        """U+FFFE i surogat w nazwie arkusza: plik ma być poprawny, nie „prawie”."""
+        path = self.write(
+            [Sheet(name="aukcja ￾ \udcb3 1", columns=["a"], rows=[["x"]])]
+        )
+        with zipfile.ZipFile(path) as archive:
+            ET.fromstring(archive.read("xl/workbook.xml"))
+        workbook = openpyxl.load_workbook(path)
+        self.assertEqual(workbook.sheetnames, ["aukcja 1"])
+        self.assertEqual(workbook["aukcja 1"]["A2"].value, "x")
+
+    def test_regresja_data_1899_12_31_zapisana_jako_tekst_iso(self):
+        """Numer seryjny 0 Excel pokazuje jako godzinę 00:00 — data by zniknęła."""
+        rows = [[dt.date(1899, 12, 30), dt.date(1899, 12, 31), dt.date(1900, 1, 1)]]
+        path = self.write([Sheet(name="D", columns=["a", "b", "c"], rows=rows)])
+        worksheet = openpyxl.load_workbook(path)["D"]
+        self.assertEqual(worksheet["A2"].value, "1899-12-30")
+        self.assertEqual(worksheet["B2"].value, "1899-12-31")
+        self.assertEqual(worksheet["C2"].value, dt.datetime(1900, 1, 1))
+
+    def test_regresja_wiersze_jako_iteratory_dzialaja_przy_auto_width(self):
+        """Wiersz-iterator przepadał, bo próbkę szerokości czytano „na sucho”."""
+        dane = lambda: [iter(["a1", "b1"]), iter(["a2", "b2"])]
+        oczekiwane = [["A", "B"], ["a1", "b1"], ["a2", "b2"]]
+        for auto_width in (True, False):
+            with self.subTest(auto_width=auto_width):
+                path = self.write(
+                    [Sheet(name="S", columns=["A", "B"], rows=dane())],
+                    name="iter-%s.xlsx" % auto_width,
+                    auto_width=auto_width,
+                )
+                worksheet = openpyxl.load_workbook(path)["S"]
+                self.assertEqual(
+                    [[cell.value for cell in row] for row in worksheet.iter_rows()],
+                    oczekiwane,
+                )
+
+    def test_regresja_kody_bledow_excela_zapisane_jako_tekst(self):
+        """„#N/A” z XML-a to tekst, a nie komórka BŁĘDU zatruwająca formuły."""
+        kody = ["#N/A", "#REF!", "#DIV/0!", "#VALUE!", "#NAME?", "#NULL!", "#NUM!"]
+        path = self.write([Sheet(name="E", columns=["bateria"], rows=[[k] for k in kody])])
+        worksheet = openpyxl.load_workbook(path)["E"]
+        odczytane = [
+            (worksheet.cell(row=index + 2, column=1).value,
+             worksheet.cell(row=index + 2, column=1).data_type)
+            for index in range(len(kody))
+        ]
+        self.assertEqual(odczytane, [(kod, "s") for kod in kody])
+
+    def test_regresja_kolumny_kluczowe_w_arkuszu_kontynuacji(self):
+        """Po podziale na bloki kolumn wiersz musi dać się przypisać do aukcji."""
+        columns = ["Aukcja", "Plik", "Nr pozycji"] + ["k%d" % i for i in range(10)]
+        rows = [["A-1", "pakiet.xml", nr] + ["r%dc%d" % (nr, c) for c in range(10)]
+                for nr in (1, 2)]
+        stderr = io.StringIO()
+        with mock.patch.object(xlsxwrite, "MAX_COLS_PER_SHEET", 12), redirect_stderr(stderr):
+            path = self.write([Sheet(name="Wszystkie", columns=columns, rows=iter(rows))],
+                              name="klucze.xlsx")
+        workbook = openpyxl.load_workbook(path)
+        self.assertEqual(len(workbook.sheetnames), 2)
+        drugi = workbook.worksheets[1]
+        naglowki = [cell.value for cell in drugi[1]]
+        self.assertEqual(naglowki, ["Aukcja", "Plik", "Nr pozycji", "k9"])
+        self.assertEqual(
+            [[cell.value for cell in row] for row in drugi.iter_rows(min_row=2)],
+            [["A-1", "pakiet.xml", 1, "r1c9"], ["A-1", "pakiet.xml", 2, "r2c9"]],
+        )
+        # Dane nadal komplet: pierwszy arkusz ma 12 kolumn, drugi resztę.
+        pierwszy = workbook.worksheets[0]
+        self.assertEqual([cell.value for cell in pierwszy[1]], columns[:12])
+        self.assertIn("kolumn", stderr.getvalue())
+
+    def test_kolumny_kluczowe_mozna_wylaczyc(self):
+        """``Sheet.key_columns=0`` przywraca czysty podział na bloki kolumn."""
+        columns = ["Aukcja", "Plik", "Nr pozycji"] + ["k%d" % i for i in range(10)]
+        rows = [["A-1", "pakiet.xml", 1] + ["c%d" % c for c in range(10)]]
+        with mock.patch.object(xlsxwrite, "MAX_COLS_PER_SHEET", 12), redirect_stderr(io.StringIO()):
+            path = self.write(
+                [Sheet(name="Bez", columns=columns, rows=iter(rows), key_columns=0)],
+                name="bez-kluczy.xlsx",
+            )
+        workbook = openpyxl.load_workbook(path)
+        self.assertEqual([cell.value for cell in workbook.worksheets[1][1]], ["k9"])
+
+    def test_regresja_uprawnienia_wynikaja_z_umask(self):
+        """Plik wynikowy nie może być na sztywno 0600 (tryb pliku tymczasowego)."""
+        if os.name != "posix":  # pragma: no cover - projekt działa też na Windows
+            self.skipTest("uprawnienia POSIX")
+        for maska, oczekiwany in ((0o022, 0o644), (0o077, 0o600)):
+            with self.subTest(umask=oct(maska)):
+                poprzednia = os.umask(maska)
+                try:
+                    path = self.write(
+                        [Sheet(name="U", columns=["a"], rows=[["x"]])],
+                        name="umask-%o.xlsx" % maska,
+                    )
+                finally:
+                    os.umask(poprzednia)
+                self.assertEqual(os.stat(path).st_mode & 0o777, oczekiwany)
+
+    def test_nadpisanie_zachowuje_uprawnienia_istniejacego_pliku(self):
+        """Tak jak ``open(path, "wb")``: nadpisanie nie zmienia trybu pliku."""
+        if os.name != "posix":  # pragma: no cover - projekt działa też na Windows
+            self.skipTest("uprawnienia POSIX")
+        path = self.write([Sheet(name="U", columns=["a"], rows=[["stare"]])],
+                          name="tryb.xlsx")
+        os.chmod(path, 0o640)
+        self.write([Sheet(name="U", columns=["a"], rows=[["nowe"]])], name="tryb.xlsx")
+        self.assertEqual(os.stat(path).st_mode & 0o777, 0o640)
+        self.assertEqual(openpyxl.load_workbook(path)["U"]["A2"].value, "nowe")
 
     # -- wydajność i pamięć ------------------------------------------------- #
 
@@ -878,6 +1108,122 @@ class TestOpenpyxlBackend(_BackendCase, unittest.TestCase):
     """Zapis przez openpyxl w trybie strumieniowym (``write_only``)."""
 
     BACKEND = "openpyxl"
+
+
+class TestPodpowiedziPoZapisie(unittest.TestCase):
+    """Ostrzeżenia i podpowiedzi wypisywane po zapisie skoroszytu."""
+
+    def setUp(self):
+        self._previous = os.environ.get(ENV_BACKEND)
+        self.addCleanup(self._restore_env)
+        self.tmpdir = tempfile.mkdtemp(prefix="flexit2xlsx-podpowiedzi-")
+        self.addCleanup(shutil.rmtree, self.tmpdir, ignore_errors=True)
+
+    def _restore_env(self):
+        if self._previous is None:
+            os.environ.pop(ENV_BACKEND, None)
+        else:
+            os.environ[ENV_BACKEND] = self._previous
+
+    def _zapisz(self, sheets):
+        stderr = io.StringIO()
+        with redirect_stderr(stderr):
+            write_workbook(os.path.join(self.tmpdir, "w.xlsx"), sheets)
+        return stderr.getvalue()
+
+    def test_brak_podpowiedzi_przy_malym_arkuszu(self):
+        os.environ.pop(ENV_BACKEND, None)
+        self.assertEqual(
+            self._zapisz([Sheet(name="M", columns=["a"], rows=[["x"]])]), ""
+        )
+
+    @unittest.skipIf(xlsxwrite._openpyxl is None, "openpyxl niedostępny")
+    def test_duzy_arkusz_w_trybie_auto_podpowiada_szybszy_zapis(self):
+        """Domyślny openpyxl jest ~2x wolniejszy — użytkownik ma o tym wiedzieć."""
+        os.environ.pop(ENV_BACKEND, None)  # tryb auto = openpyxl, gdy jest biblioteka
+        with mock.patch.object(xlsxwrite, "SLOW_BACKEND_HINT_ROWS", 2):
+            message = self._zapisz(
+                [Sheet(name="D", columns=["a"], rows=[["x"], ["y"], ["z"]])]
+            )
+        self.assertIn("stdlib", message)
+        self.assertIn(ENV_BACKEND, message)
+
+    def test_wymuszony_backend_nie_dostaje_podpowiedzi(self):
+        """Kto sam wybrał ścieżkę zapisu, nie potrzebuje porady."""
+        os.environ[ENV_BACKEND] = "stdlib"
+        with mock.patch.object(xlsxwrite, "SLOW_BACKEND_HINT_ROWS", 2):
+            message = self._zapisz(
+                [Sheet(name="D", columns=["a"], rows=[["x"], ["y"], ["z"]])]
+            )
+        self.assertEqual(message, "")
+
+
+@unittest.skipIf(openpyxl is None, "openpyxl niedostępny")
+class TestZgodnosciBackendow(unittest.TestCase):
+    """Te same dane MUSZĄ dać ten sam arkusz w obu ścieżkach zapisu.
+
+    Rozjazdy między ścieżkami są dla użytkownika najgorszym rodzajem błędu:
+    wynik zależy wtedy od tego, czy ktoś ma zainstalowany openpyxl.
+    """
+
+    #: Wsad zbierający wszystkie przypadki, w których ścieżki się rozjeżdżały.
+    KOLUMNY = ["zwykła", "kol\x0bumna", "A" * 40000, "=SUMA", "kol\udcb3umna"]
+    WIERSZE = [
+        ["#N/A", "=A1+1", "B" * 40000, dt.date(1899, 12, 31), "16 GB"],
+        ["#REF!", "-5", 1234, dt.date(1900, 1, 1), None],
+        ["tekst", True, 3.5, dt.datetime(2026, 6, 18, 9, 30), POLSKIE],
+    ]
+
+    def setUp(self):
+        self._previous = os.environ.get(ENV_BACKEND)
+        self.addCleanup(self._restore_env)
+        self.tmpdir = tempfile.mkdtemp(prefix="flexit2xlsx-zgodnosc-")
+        self.addCleanup(shutil.rmtree, self.tmpdir, ignore_errors=True)
+
+    def _restore_env(self):
+        if self._previous is None:
+            os.environ.pop(ENV_BACKEND, None)
+        else:
+            os.environ[ENV_BACKEND] = self._previous
+
+    def _zapisz(self, backend):
+        os.environ[ENV_BACKEND] = backend
+        self.assertEqual(backend_name(), backend)
+        path = os.path.join(self.tmpdir, "%s.xlsx" % backend)
+        with redirect_stderr(io.StringIO()):
+            write_workbook(
+                path,
+                [Sheet(name="aukcja ￾ 1", columns=list(self.KOLUMNY),
+                       rows=[list(row) for row in self.WIERSZE])],
+            )
+        workbook = openpyxl.load_workbook(path)
+        worksheet = workbook.worksheets[0]
+        return workbook.sheetnames, [
+            [(cell.value, cell.data_type) for cell in row] for row in worksheet.iter_rows()
+        ]
+
+    def test_ta_sama_zawartosc_arkusza_w_obu_sciezkach(self):
+        nazwy_stdlib, dane_stdlib = self._zapisz("stdlib")
+        nazwy_openpyxl, dane_openpyxl = self._zapisz("openpyxl")
+        self.assertEqual(nazwy_stdlib, nazwy_openpyxl)
+        self.assertEqual(dane_stdlib, dane_openpyxl)
+
+    def test_limity_i_typy_sa_dotrzymane_w_obu_sciezkach(self):
+        for backend in ("stdlib", "openpyxl"):
+            with self.subTest(backend=backend):
+                nazwy, dane = self._zapisz(backend)
+                self.assertEqual(nazwy, ["aukcja 1"])
+                naglowek = [wartosc for wartosc, _ in dane[0]]
+                self.assertEqual(naglowek[0], "zwykła")
+                self.assertEqual(naglowek[1], "kolumna")
+                self.assertEqual(len(naglowek[2]), MAX_CELL_CHARS)
+                self.assertEqual(naglowek[4], "kolumna")
+                self.assertTrue(all(typ == "s" for _, typ in dane[0]))
+                # "#N/A" i "=A1+1" to tekst, nie błąd i nie formuła.
+                self.assertEqual(dane[1][0], ("#N/A", "s"))
+                self.assertEqual(dane[1][1], ("=A1+1", "s"))
+                self.assertEqual(len(dane[1][2][0]), MAX_CELL_CHARS)
+                self.assertEqual(dane[1][3], ("1899-12-31", "s"))
 
 
 if __name__ == "__main__":  # pragma: no cover

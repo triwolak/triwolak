@@ -8,15 +8,21 @@ szerokim spektrum struktur, kodowań i przypadków złośliwych.
 
 from __future__ import annotations
 
+import contextlib
 import inspect
+import io
+import itertools
 import os
+import random
 import sys
 import tempfile
+import tracemalloc
 import types
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from flexit2xlsx import xmlflatten  # noqa: E402
 from flexit2xlsx.xmlflatten import (  # noqa: E402
     ParsedDoc,
     XmlParseError,
@@ -307,8 +313,8 @@ class TestFlattening(unittest.TestCase):
         doc = parse_bytes(XML_LOTS, "lots.xml")
         self.assertEqual(len(doc.records), 3)
         self.assertEqual(doc.records[0],
-                         {"@nr": "1", "name": "Laptop", "qty": "2", "price": "100.50"})
-        self.assertIn("@nr", doc.columns)
+                         {"lot@nr": "1", "name": "Laptop", "qty": "2", "price": "100.50"})
+        self.assertIn("lot@nr", doc.columns)
         self.assertIn("auction/title", doc.columns)
         # kolumny kontekstu ida przed kolumnami rekordu
         self.assertLess(doc.columns.index("auction/title"), doc.columns.index("name"))
@@ -333,7 +339,8 @@ class TestFlattening(unittest.TestCase):
 
     def test_atrybuty_rekordu_i_przodkow(self):
         doc = parse_bytes(XML_PACKAGE, "p.xml")
-        self.assertEqual(doc.records[0], {"@id": "1", "@sku": "X1", "@qty": "3"})
+        self.assertEqual(doc.records[0],
+                         {"item@id": "1", "item@sku": "X1", "item@qty": "3"})
         self.assertEqual(doc.context["package@auction"], "AUK/2024/7")
         self.assertEqual(doc.context["package@generated"], "2024-05-01")
 
@@ -343,8 +350,8 @@ class TestFlattening(unittest.TestCase):
 
     def test_plaskie_wiersze_tylko_atrybuty(self):
         doc = parse_bytes(XML_FLAT_ROWS, "f.xml")
-        self.assertEqual(doc.columns, ["@a", "@b", "@c"])
-        self.assertEqual([r["@a"] for r in doc.records], ["1", "4", "7"])
+        self.assertEqual(doc.columns, ["row@a", "row@b", "row@c"])
+        self.assertEqual([r["row@a"] for r in doc.records], ["1", "4", "7"])
 
     def test_pary_klucz_wartosc_z_atrybutow(self):
         doc = parse_bytes(XML_SPECS, "s.xml")
@@ -431,8 +438,8 @@ class TestFlattening(unittest.TestCase):
 
     def test_rekord_bedacy_lisciem_z_atrybutami_i_trescia(self):
         doc = parse_bytes(b"<r><i a='1'>tekst</i><i a='2'>inny</i></r>", "t.xml")
-        # tresc rekordu trafia do kolumny o nazwie jego tagu
-        self.assertEqual(doc.records[0], {"@a": "1", "i": "tekst"})
+        # tresc rekordu trafia do kolumny o nazwie jego tagu, atrybut tez
+        self.assertEqual(doc.records[0], {"i@a": "1", "i": "tekst"})
 
     def test_brak_kolizji_nazw_kontekstu_i_rekordu(self):
         dane = b"<a><name>AUKCJA</name><i><name>X</name></i><i><name>Y</name></i></a>"
@@ -456,7 +463,7 @@ class TestFlattening(unittest.TestCase):
 
     def test_kolejnosc_kolumn_wg_pierwszego_wystapienia(self):
         doc = parse_bytes(XML_LOTS, "l.xml")
-        self.assertEqual(doc.columns[-4:], ["@nr", "name", "qty", "price"])
+        self.assertEqual(doc.columns[-4:], ["lot@nr", "name", "qty", "price"])
 
 
 class TestAuctionId(unittest.TestCase):
@@ -490,12 +497,12 @@ class TestNamespaces(unittest.TestCase):
     def test_strip_ns_domyslnie(self):
         doc = parse_bytes(XML_NS, "ns.xml")
         self.assertEqual(doc.context, {"auction/auction_id": "NS-1"})
-        self.assertEqual(doc.records[0], {"@code": "k1", "label": "Alfa"})
+        self.assertEqual(doc.records[0], {"position@code": "k1", "label": "Alfa"})
 
     def test_bez_strip_ns_zachowuje_prefiksy(self):
         doc = parse_bytes(XML_NS, "ns.xml", strip_ns=False)
         self.assertEqual(doc.record_path, "a:auction/{urn:def}positions/{urn:def}position")
-        self.assertEqual(doc.records[0]["@x:code"], "k1")
+        self.assertEqual(doc.records[0]["position@x:code"], "k1")
         self.assertIn("a:auction/a:auction_id", doc.context)
 
     def test_niezadeklarowany_prefiks_nie_wywala_parsera(self):
@@ -503,14 +510,17 @@ class TestNamespaces(unittest.TestCase):
         dane = b"<r><x:foo a='1'>v</x:foo><x:foo a='2'>w</x:foo></r>"
         doc = parse_bytes(dane, "u.xml")
         self.assertEqual(doc.record_path, "r/foo")
-        self.assertEqual(doc.records[0], {"@a": "1", "foo": "v"})
+        self.assertEqual(doc.records[0], {"foo@a": "1", "foo": "v"})
         self.assertEqual(parse_bytes(dane, "u.xml", strip_ns=False).record_path, "r/x:foo")
 
     def test_wiele_przestrzeni_ten_sam_lokalny_tag(self):
         data = (b"<r xmlns:p='urn:p' xmlns:q='urn:q'>"
                 b"<i><p:v>1</p:v><q:v>2</q:v></i><i><p:v>3</p:v><q:v>4</q:v></i></r>")
-        # przy strip_ns=True oba tagi zlewaja sie w jedna kolumne (sklejenie)
-        self.assertEqual(parse_bytes(data, "n.xml").records[0], {"v": "1 | 2"})
+        # przy strip_ns=True pierwsza przestrzen dostaje gola nazwe, druga
+        # zachowuje prefiks - dwa rozne pola NIE moga trafic do jednej komorki
+        with contextlib.redirect_stderr(io.StringIO()):
+            doc = parse_bytes(data, "n.xml")
+        self.assertEqual(doc.records[0], {"v": "1", "q:v": "2"})
         # bez strip_ns pozostaja rozdzielne
         doc = parse_bytes(data, "n.xml", strip_ns=False)
         self.assertEqual(doc.records[0], {"p:v": "1", "q:v": "2"})
@@ -620,15 +630,16 @@ class TestSecurity(unittest.TestCase):
         self.assertEqual(doc.records[0]["n"], "Flexit sp. z o.o.")
 
     def test_zbyt_wiele_deklaracji_encji(self):
-        decls = b"".join(b'<!ENTITY e%d "x">' % i for i in range(200))
+        decls = b"".join(b'<!ENTITY e%d "x">' % i for i in range(5000))
         with self.assertRaises(XmlParseError):
             parse_bytes(b"<!DOCTYPE d [" + decls + b"]><d/>", "e.xml")
 
-    def test_zbyt_gleboki_dokument(self):
-        data = b"<a>" + b"<b>" * 500 + b"x" + b"</b>" * 500 + b"</a>"
+    def test_laczna_tresc_encji_jest_ograniczona(self):
+        wielka = b"x" * 100_000
+        decls = b"".join(b'<!ENTITY e%d "%s">' % (i, wielka) for i in range(5))
         with self.assertRaises(XmlParseError) as ctx:
-            parse_bytes(data, "deep.xml")
-        self.assertIn("zagnie", str(ctx.exception).lower())
+            parse_bytes(b"<!DOCTYPE d [" + decls + b"]><d/>", "e.xml")
+        self.assertIn("bomb", str(ctx.exception).lower())
 
 
 class TestBledy(unittest.TestCase):
@@ -658,11 +669,13 @@ class TestBledy(unittest.TestCase):
 
     def test_encje_htmlowe_sa_ratowane(self):
         # eksporty portali bywaja "HTML-owe"; &nbsp; nie moze wywalac calego pliku
-        doc = parse_bytes(b"<r><i><a>x&nbsp;y</a><b>&mdash;</b><c>&nieznana;</c></i>"
-                          b"<i><a>z</a></i></r>", "html.xml")
+        with contextlib.redirect_stderr(io.StringIO()):
+            doc = parse_bytes(b"<r><i><a>x&nbsp;y</a><b>&mdash;</b><c>&nieznana;</c></i>"
+                              b"<i><a>z</a></i></r>", "html.xml")
         self.assertEqual(doc.records[0]["a"], "x y")
         self.assertEqual(doc.records[0]["b"], "—")
-        self.assertIsNone(doc.records[0]["c"])
+        # encja spoza HTML5 zostaje DOSLOWNIE - nic nie znika po cichu
+        self.assertEqual(doc.records[0]["c"], "&nieznana;")
 
 
 class TestMergeIRows(unittest.TestCase):
@@ -810,6 +823,451 @@ class TestWeryfikacjaLxml(unittest.TestCase):
             tekst = " ".join(str(tekst).split())
             if tekst:
                 self.assertIn(tekst, komorki)
+
+
+# ---------------------------------------------------------------------------
+# Testy REGRESJI – każdy odpowiada wadzie zgłoszonej przez testerów
+# ---------------------------------------------------------------------------
+
+BATCH_1_ZE_ZDJECIAMI = b"""<?xml version="1.0" encoding="UTF-8"?>
+<batch lotHash="bbbbb" auction="flexit-auctions-18-06-2026-1103">
+  <lot><title>1x Dell OptiPlex</title>
+    <photos><photo>https://media/1.jpg</photo><photo>https://media/2.jpg</photo>
+            <photo>https://media/3.jpg</photo><photo>https://media/4.jpg</photo></photos>
+    <items>
+      <item nr="1"><model>OptiPlex 7050</model><serial>DL9</serial><grade>A</grade></item>
+    </items></lot>
+</batch>"""
+
+
+def _stderr(funkcja, *args, **kw):
+    """Uruchamia funkcję i zwraca (wynik, tekst wypisany na stderr)."""
+    bufor = io.StringIO()
+    with contextlib.redirect_stderr(bufor):
+        wynik = funkcja(*args, **kw)
+    return wynik, bufor.getvalue()
+
+
+class TestRegresjaWykrywaniaRekordu(unittest.TestCase):
+    """WADA: zdjęcia/załączniki wygrywały z pozycją pakietu (wiersze-widma)."""
+
+    def test_zdjecia_nie_wygrywaja_z_pozycja_pakietu(self):
+        doc = parse_bytes(BATCH_1_ZE_ZDJECIAMI, "batch_bbbbb.xml")
+        self.assertEqual(doc.record_path, "batch/lot/items/item")
+        self.assertEqual(len(doc.records), 1)
+        self.assertEqual(doc.records[0]["model"], "OptiPlex 7050")
+        # zdjęcia lądują w JEDNEJ kolumnie kontekstu, sklejone separatorem
+        self.assertEqual(doc.context["batch/lot/photos/photo"].count("|"), 3)
+        # dane sztuki NIE mogą się dublować w kontekście
+        self.assertNotIn("batch/lot/items/item/model", doc.context)
+
+    def test_pakiet_wielosztukowy_dalej_dziala(self):
+        dane = (b"<batch><lot><title>3x</title><items>"
+                b"<item nr='1'><model>A</model><serial>1</serial></item>"
+                b"<item nr='2'><model>B</model><serial>2</serial></item>"
+                b"<item nr='3'><model>C</model><serial>3</serial></item>"
+                b"</items></lot></batch>")
+        doc = parse_bytes(dane, "b.xml")
+        self.assertEqual(doc.record_path, "batch/lot/items/item")
+        self.assertEqual(len(doc.records), 3)
+
+    def test_kolumny_zgodne_miedzy_plikiem_1_i_3_sztukowym(self):
+        trzy = (b"<batch lotHash='aaaaa'><lot><title>3x</title><items>"
+                b"<item nr='1'><model>A</model><serial>1</serial><grade>B</grade></item>"
+                b"<item nr='2'><model>B</model><serial>2</serial><grade>A</grade></item>"
+                b"<item nr='3'><model>C</model><serial>3</serial><grade>C</grade></item>"
+                b"</items></lot></batch>")
+        docs = [parse_bytes(trzy, "a.xml"), parse_bytes(BATCH_1_ZE_ZDJECIAMI, "b.xml")]
+        kolumny = merge_columns(docs)
+        self.assertIn("model", kolumny)
+        self.assertNotIn("batch/lot/items/item/model", kolumny)
+        self.assertEqual(sum(len(d.records) for d in docs), 4)
+
+    def test_brak_powtorzen_dalej_daje_jeden_wiersz(self):
+        # kontrakt: gdy NIC się nie powtarza, dokument jest jednym wierszem
+        self.assertIsNone(parse_bytes(XML_SINGLE, "s.xml").record_path)
+        self.assertIsNone(parse_bytes(b"<pakiet/>", "p.xml").record_path)
+
+    def test_powtarzalny_lisc_wygrywa_gdy_nie_ma_lepszego(self):
+        # bez elementu o nazwie typowej dla pozycji zostaje stara heurystyka
+        doc = parse_bytes(b"<root><t>a</t><t>b</t><t>c</t></root>", "t.xml")
+        self.assertEqual(doc.record_path, "root/t")
+        self.assertEqual(len(doc.records), 3)
+
+
+class TestRegresjaParKluczWartosc(unittest.TestCase):
+    """WADY: niespójne spłaszczanie cech, kolizje nazw i gubiona treść."""
+
+    def test_rekord_z_jedna_cecha_ma_te_same_kolumny_co_z_dwiema(self):
+        dane = (b"<aukcja id='A-1'>"
+                b"<pozycja><sn>1</sn><opcja nazwa='Kolor'>czarny</opcja>"
+                b"<opcja nazwa='Rozmiar'>M</opcja></pozycja>"
+                b"<pozycja><sn>2</sn><opcja nazwa='Kolor'>bialy</opcja></pozycja>"
+                b"</aukcja>")
+        doc = parse_bytes(dane, "o.xml")
+        self.assertEqual(doc.records[0], {"sn": "1", "Kolor": "czarny", "Rozmiar": "M"})
+        self.assertEqual(doc.records[1], {"sn": "2", "Kolor": "bialy"})
+        self.assertNotIn("opcja", doc.columns)
+        self.assertNotIn("opcja@nazwa", doc.columns)
+
+    def test_nazwa_cechy_kolidujaca_z_tagiem_daje_osobna_kolumne(self):
+        dane = (b"<aukcja><item><model>ThinkPad X230</model>"
+                b"<spec name='model'>i5-3320M</spec></item>"
+                b"<item><model>T440</model><spec name='model'>i5-4300U</spec></item>"
+                b"</aukcja>")
+        doc = parse_bytes(dane, "k.xml")
+        self.assertEqual(doc.records[0], {"model": "ThinkPad X230", "spec/model": "i5-3320M"})
+        self.assertEqual(doc.records[1], {"model": "T440", "spec/model": "i5-4300U"})
+
+    def test_klucz_z_ukosnikiem_i_malpa_jest_eskejpowany(self):
+        dane = (b"<a><i><spec name='a/b'>1</spec><spec name='c@d'>2</spec></i>"
+                b"<i><spec name='a/b'>3</spec><spec name='c@d'>4</spec></i></a>")
+        doc = parse_bytes(dane, "e.xml")
+        self.assertEqual(doc.records[0], {"a_b": "1", "c_d": "2"})
+
+    def test_tekst_elementu_pary_nie_ginie(self):
+        dane = (b"<aukcja><item><spec name='RAM' value='16 GB'>po rozbudowie</spec></item>"
+                b"<item><spec name='RAM' value='8 GB'>fabryczne</spec></item></aukcja>")
+        doc = parse_bytes(dane, "s.xml")
+        self.assertEqual(doc.records[0]["RAM"], "16 GB")
+        self.assertEqual(doc.records[0]["RAM (tekst)"], "po rozbudowie")
+        self.assertEqual(doc.records[1]["RAM (tekst)"], "fabryczne")
+
+    def test_atrybuty_elementu_klucza_nie_gina(self):
+        dane = (b"<aukcja><item>"
+                b"<cecha><nazwa jezyk='pl' id='C1'>Kolor</nazwa><wartosc>czarny</wartosc></cecha>"
+                b"<cecha><nazwa jezyk='pl' id='C2'>Rozmiar</nazwa><wartosc>M</wartosc></cecha>"
+                b"</item><item><sn>2</sn></item></aukcja>")
+        doc = parse_bytes(dane, "c.xml")
+        self.assertEqual(doc.records[0]["Kolor"], "czarny")
+        self.assertEqual(doc.records[0]["Rozmiar"], "M")
+        self.assertIn("C1", doc.records[0]["cecha/nazwa@id"])
+        self.assertIn("pl", doc.records[0]["cecha/nazwa@jezyk"])
+
+    def test_para_bez_wartosci_dalej_jest_spłaszczana_normalnie(self):
+        dane = (b"<r><i><imgs><image name='a' url='u1'/><image name='b' url='u2'/></imgs>"
+                b"<x>1</x></i><i><imgs><image name='c' url='u3'/>"
+                b"<image name='d' url='u4'/></imgs><x>2</x></i></r>")
+        doc = parse_bytes(dane, "img.xml")
+        self.assertEqual(doc.records[0]["imgs/image@url"], "u1 | u2")
+        self.assertNotIn("imgs/a", doc.records[0])
+
+    def test_para_klucz_wartosc_nie_zjada_rekordow(self):
+        # <value nazwa=... wartosc=...> wygląda na parę, ale w środku są rekordy
+        dane = (b"<a><value nazwa='K' wartosc='W'>"
+                b"<item id='1'>x</item><item id='2'>y</item></value></a>")
+        doc = parse_bytes(dane, "z.xml")
+        self.assertEqual(doc.record_path, "a/value/item")
+        self.assertEqual(len(doc.records), 2)
+        self.assertNotIn("K", doc.context)
+
+
+class TestRegresjaPrzestrzeniNazw(unittest.TestCase):
+    """WADA: obcinanie prefiksów zlewało dwa różne pola w jedną komórkę."""
+
+    XML = (b"<b xmlns:dc='http://purl.org/dc/elements/1.1/' xmlns:f='http://flexit/'>"
+           b"<i><dc:title>Katalogowy</dc:title><f:title>Sprzedazy</f:title></i>"
+           b"<i><dc:title>A</dc:title><f:title>B</f:title></i></b>")
+
+    def test_dwie_przestrzenie_daja_dwie_kolumny(self):
+        doc, err = _stderr(parse_bytes, self.XML, "ns.xml")
+        self.assertEqual(len(doc.columns), 2)
+        self.assertEqual(doc.records[0]["title"], "Katalogowy")
+        self.assertEqual(doc.records[0]["f:title"], "Sprzedazy")
+        self.assertIn("keep-ns", err)
+
+    def test_bez_kolizji_nazwa_zostaje_goła(self):
+        dane = (b"<b xmlns:dc='http://purl.org/dc/elements/1.1/'>"
+                b"<i><dc:title>A</dc:title><sn>1</sn></i>"
+                b"<i><dc:title>B</dc:title><sn>2</sn></i></b>")
+        doc, err = _stderr(parse_bytes, dane, "ns2.xml")
+        self.assertEqual(doc.records[0], {"title": "A", "sn": "1"})
+        self.assertEqual(err, "")
+
+
+class TestRegresjaEncji(unittest.TestCase):
+    """WADY: poprawne encje odrzucały plik, a naprawa psuła treść CDATA."""
+
+    def test_encja_z_zaeskejpowanym_ampersandem_dziala(self):
+        doc = parse_bytes(b'<!DOCTYPE a [<!ENTITY firma "Kowalski &amp; Syn">]>'
+                          b"<a><i><n>&firma;</n></i><i><n>b</n></i></a>", "e.xml")
+        self.assertEqual(doc.records[0]["n"], "Kowalski & Syn")
+
+    def test_dluga_encja_dziala(self):
+        dane = (b'<!DOCTYPE a [<!ENTITY op "' + b"x" * 1100 + b'">]>'
+                b"<a><i><n>&op;</n></i><i><n>b</n></i></a>")
+        self.assertEqual(len(parse_bytes(dane, "d.xml").records[0]["n"]), 1100)
+
+    def test_siedemdziesiat_deklaracji_encji_dziala(self):
+        decls = b"".join(b'<!ENTITY e%d "v%d">' % (i, i) for i in range(70))
+        doc = parse_bytes(b"<!DOCTYPE a [" + decls + b"]>"
+                          b"<a><i><n>&e0;</n></i><i><n>&e69;</n></i></a>", "w.xml")
+        self.assertEqual([r["n"] for r in doc.records], ["v0", "v69"])
+
+    def test_bomba_encyjna_dalej_zablokowana(self):
+        with self.assertRaises(XmlParseError):
+            parse_bytes(b"<!DOCTYPE a [<!ENTITY a 'aaaaaaaaaa'>"
+                        b"<!ENTITY b '&a;&a;&a;&a;&a;&a;&a;&a;&a;&a;'>"
+                        b"<!ENTITY c '&b;&b;&b;&b;&b;&b;&b;&b;&b;&b;'>]>"
+                        b"<a><i><n>&c;</n></i><i><n>x</n></i></a>", "b.xml")
+
+    def test_naprawa_encji_nie_rusza_CDATA(self):
+        dane = ("<?xml version='1.0' encoding='UTF-8'?><lot><opis>Cena&nbsp;netto</opis>"
+                "<items><item><sku>A1</sku>"
+                "<note><![CDATA[Firma &raquo; model &kod_producenta; koniec]]></note></item>"
+                "<item><sku>A2</sku><note><![CDATA[R&D 100]]></note></item>"
+                "</items></lot>").encode("utf-8")
+        doc, err = _stderr(parse_bytes, dane, "cdata.xml")
+        self.assertEqual(doc.records[0]["note"],
+                         "Firma &raquo; model &kod_producenta; koniec")
+        self.assertEqual(doc.records[0]["sku"], "A1")
+        self.assertEqual(doc.records[1]["note"], "R&D 100")
+        self.assertIn("encje", err)      # użytkownik wie, że coś naprawiono
+
+    def test_nieznana_encja_zostaje_doslownie_i_ostrzega(self):
+        doc, err = _stderr(parse_bytes,
+                           b"<a><i><n>AT&amp;T &nieznana; koniec</n></i>"
+                           b"<i><n>b</n></i></a>", "u.xml")
+        self.assertEqual(doc.records[0]["n"], "AT&T &nieznana; koniec")
+        self.assertIn("encje", err)
+
+
+class TestRegresjaKodowan(unittest.TestCase):
+    """WADY: ciche krzaki przy błędnej deklaracji i przy zgadywaniu kodowania."""
+
+    SZABLON = ("<?xml version='1.0' encoding='%s'?>"
+               "<a><i><n>zażółć gęślą</n></i><i><n>b</n></i></a>")
+
+    def test_utf8_z_bledna_deklaracja_iso(self):
+        dane = (self.SZABLON % "ISO-8859-2").encode("utf-8")
+        doc, err = _stderr(parse_bytes, dane, "k.xml")
+        self.assertEqual(doc.records[0]["n"], "zażółć gęślą")
+        self.assertIn("UTF-8", err)
+
+    def test_iso88592_bez_deklaracji(self):
+        dane = "<a><i><n>zażółć gęślą</n></i><i><n>b</n></i></a>".encode("iso-8859-2")
+        doc, err = _stderr(parse_bytes, dane, "x.xml")
+        self.assertEqual(doc.records[0]["n"], "zażółć gęślą")
+        self.assertIn("iso-8859-2", err)
+
+    def test_cp1250_bez_deklaracji(self):
+        dane = "<a><i><n>zażółć gęślą</n></i><i><n>b</n></i></a>".encode("cp1250")
+        doc, err = _stderr(parse_bytes, dane, "x.xml")
+        self.assertEqual(doc.records[0]["n"], "zażółć gęślą")
+        self.assertIn("cp1250", err)
+
+    def test_nieznana_nazwa_kodowania_ostrzega(self):
+        dane = ("<?xml version='1.0' encoding='x-mac-central-europe'?>"
+                "<a><i><n>zazolc</n></i><i><n>b</n></i></a>").encode("mac-latin2")
+        doc, err = _stderr(parse_bytes, dane, "m.xml")
+        self.assertEqual(doc.records[0]["n"], "zazolc")
+        self.assertIn("nieznana nazwa kodowania", err)
+
+    def test_deklaracje_zgodne_z_trescia_nie_ostrzegaja(self):
+        for kodowanie in ("UTF-8", "ISO-8859-2", "windows-1250"):
+            with self.subTest(kodowanie=kodowanie):
+                dane = (self.SZABLON % kodowanie).encode(
+                    "utf-8" if kodowanie == "UTF-8" else kodowanie)
+                doc, err = _stderr(parse_bytes, dane, "z.xml")
+                self.assertEqual(doc.records[0]["n"], "zażółć gęślą")
+                self.assertEqual(err, "")
+
+
+class TestRegresjaTresciRodzica(unittest.TestCase):
+    """WADA: tekst elementu-rodzica rekordów znikał bez śladu."""
+
+    def test_tekst_rodzica_rekordow_trafia_do_kontekstu(self):
+        dane = ("<aukcja id='A-1'>Sprzet uzywany, odbior osobisty."
+                "<pozycja><nazwa>Laptop</nazwa></pozycja>"
+                "<pozycja><nazwa>Monitor</nazwa></pozycja></aukcja>").encode("utf-8")
+        doc = parse_bytes(dane, "m.xml")
+        self.assertEqual(doc.context["aukcja"], "Sprzet uzywany, odbior osobisty.")
+        self.assertEqual(doc.context["aukcja@id"], "A-1")
+
+    def test_tekst_przodka_rekordow_nie_wciaga_tresci_pozycji(self):
+        dane = (b"<a><lot>Opis lotu<items><item><m>X</m></item>"
+                b"<item><m>Y</m></item></items></lot></a>")
+        doc = parse_bytes(dane, "p.xml")
+        self.assertEqual(doc.context["a/lot"], "Opis lotu")
+        self.assertNotIn("X", str(doc.context))
+
+    def test_fuzzing_strukturalny_nie_gubi_wartosci(self):
+        """Losowe dokumenty: KAŻDA wartość musi trafić do komórki albo nagłówka."""
+        rnd = random.Random(7)
+        tagi = ["pozycja", "spec", "opcja", "cecha", "name", "value", "nazwa", "lot", "x"]
+        atrybuty = ["id", "name", "nazwa", "value", "wartosc", "typ"]
+
+        def buduj(glebokosc, licznik):
+            tag = rnd.choice(tagi)
+            attrs = {rnd.choice(atrybuty): "V%05d" % next(licznik)
+                     for _ in range(rnd.randint(0, 2))}
+            dzieci, tekst = [], ""
+            if glebokosc > 0 and rnd.random() < 0.7:
+                dzieci = [buduj(glebokosc - 1, licznik) for _ in range(rnd.randint(1, 3))]
+                if rnd.random() < 0.2:
+                    tekst = "V%05d" % next(licznik)
+            else:
+                tekst = "V%05d" % next(licznik)
+            return (tag, attrs, tekst, dzieci)
+
+        def rysuj(wezel):
+            tag, attrs, tekst, dzieci = wezel
+            opis = "".join(' %s="%s"' % (k, v) for k, v in attrs.items())
+            srodek = tekst + "".join(rysuj(k) for k in dzieci)
+            if not srodek:
+                return "<%s%s/>" % (tag, opis)
+            return "<%s%s>%s</%s>" % (tag, opis, srodek, tag)
+
+        def wartosci(wezel, zbior):
+            tag, attrs, tekst, dzieci = wezel
+            zbior.update(attrs.values())
+            if tekst:
+                zbior.add(tekst)
+            for kid in dzieci:
+                wartosci(kid, zbior)
+            return zbior
+
+        for numer in range(200):
+            licznik = itertools.count(1)
+            korzen = ("aukcja", {"id": "A%04d" % numer}, "",
+                      [buduj(3, licznik) for _ in range(rnd.randint(2, 5))])
+            xml = "<?xml version='1.0' encoding='UTF-8'?>" + rysuj(korzen)
+            doc = parse_bytes(xml.encode("utf-8"), "fuzz.xml")
+            blob = "\n".join(
+                [str(v) for v in doc.context.values()]
+                + [str(v) for r in doc.records for v in r.values()]
+                + list(doc.context.keys())
+                + [k for r in doc.records for k in r.keys()])
+            brakujace = [v for v in wartosci(korzen, set()) if v not in blob]
+            self.assertEqual(brakujace, [], "dokument %d gubi wartości:\n%s"
+                             % (numer, xml[:400]))
+
+
+class TestRegresjaZagniezdzenia(unittest.TestCase):
+    """WADA: zagnieżdżenie ponad limit odrzucało CAŁY plik."""
+
+    def test_gleboka_galaz_jest_obcinana_a_plik_wczytany(self):
+        srodek = ("".join("<n%d>" % i for i in range(500)) + "X"
+                  + "".join("</n%d>" % i for i in reversed(range(500))))
+        dane = ("<root><item><tytul>Lot 1</tytul><sn>SN1</sn>%s</item>"
+                "<item><tytul>Lot 2</tytul><sn>SN2</sn>%s</item></root>"
+                % (srodek, srodek)).encode("utf-8")
+        doc, err = _stderr(parse_bytes, dane, "deep.xml")
+        self.assertEqual(len(doc.records), 2)
+        self.assertEqual(doc.records[0]["tytul"], "Lot 1")
+        self.assertEqual(doc.records[1]["sn"], "SN2")
+        self.assertIn("obcięto", err)
+
+    def test_plytki_dokument_nie_ostrzega(self):
+        doc, err = _stderr(parse_bytes, XML_LOTS, "l.xml")
+        self.assertEqual(err, "")
+        self.assertEqual(len(doc.records), 3)
+
+
+class TestRegresjaPamieci(unittest.TestCase):
+    """WADA: poprawny plik 191 kB wyczerpywał 900 MB RAM (kwadratowy _scan)."""
+
+    @staticmethod
+    def _gleboki(glebokosc: int, liscie: int) -> bytes:
+        czesci = ["<?xml version='1.0'?>"]
+        czesci += ["<n%d>" % i for i in range(glebokosc)]
+        czesci += ["<f%d>v</f%d>" % (j, j) for j in range(liscie)]
+        czesci += ["</n%d>" % i for i in reversed(range(glebokosc))]
+        return "".join(czesci).encode("utf-8")
+
+    def test_pamiec_jest_proporcjonalna_do_rozmiaru(self):
+        dane = self._gleboki(120, 1500)
+        tracemalloc.start()
+        try:
+            parse_bytes(dane, "bomba.xml")
+            _, szczyt = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        krotnosc = szczyt / len(dane)
+        self.assertLess(krotnosc, 300,
+                        "plik %d B zajął %.1f MB (%.0f-krotność rozmiaru)"
+                        % (len(dane), szczyt / 1e6, krotnosc))
+
+    def test_limit_liczby_sciezek(self):
+        poprzedni = xmlflatten._MAX_PATHS
+        xmlflatten._MAX_PATHS = 50
+        self.addCleanup(setattr, xmlflatten, "_MAX_PATHS", poprzedni)
+        dane = (b"<a>" + b"".join(b"<t%d>v</t%d>" % (i, i) for i in range(200))
+                + b"</a>")
+        with self.assertRaises(XmlParseError) as ctx:
+            parse_bytes(dane, "szeroki.xml")
+        self.assertIn("record-path", str(ctx.exception))
+
+    def test_limit_liczby_elementow(self):
+        poprzedni = xmlflatten._MAX_ELEMENTS
+        xmlflatten._MAX_ELEMENTS = 50
+        self.addCleanup(setattr, xmlflatten, "_MAX_ELEMENTS", poprzedni)
+        dane = b"<a>" + b"<i><x>v</x></i>" * 100 + b"</a>"
+        with self.assertRaises(XmlParseError):
+            parse_bytes(dane, "duzy.xml")
+
+
+class TestRegresjaTrybStrumieniowy(unittest.TestCase):
+    """Duże pliki idą przez dwa przebiegi – wynik musi być IDENTYCZNY."""
+
+    PROBKI = [XML_LOTS, XML_PACKAGE, XML_FLAT_ROWS, XML_NS, XML_SPECS,
+              XML_SPECS_ELEMENTS, XML_SINGLE, XML_META, XML_MIXED, XML_NESTED,
+              XML_MANY_SPECS, XML_BATCH, XML_REPEATED_CHILD,
+              BATCH_1_ZE_ZDJECIAMI]
+
+    def test_oba_tryby_daja_ten_sam_wynik(self):
+        for numer, dane in enumerate(self.PROBKI):
+            tekst = xmlflatten._decode(dane, "x.xml")
+            for repeat in ("join", "index"):
+                for strip in (True, False):
+                    with self.subTest(numer=numer, repeat=repeat, strip_ns=strip):
+                        w_pamieci = xmlflatten._parse_in_memory(
+                            tekst, "x.xml", strip, repeat, " | ", None)
+                        strumieniowo = xmlflatten._parse_streaming(
+                            tekst, "x.xml", strip, repeat, " | ", None)
+                        self.assertEqual(w_pamieci, strumieniowo)
+
+    def test_jawna_sciezka_rekordu_w_obu_trybach(self):
+        for wskazana in ("lot", "auction/lots/lot", "auction"):
+            with self.subTest(record_path=wskazana):
+                tekst = xmlflatten._decode(XML_LOTS, "x.xml")
+                w_pamieci = xmlflatten._parse_in_memory(
+                    tekst, "x.xml", True, "join", " | ", wskazana)
+                strumieniowo = xmlflatten._parse_streaming(
+                    tekst, "x.xml", True, "join", " | ", wskazana)
+                self.assertEqual(w_pamieci, strumieniowo)
+        # rekordem jest sam korzeń -> kontekst pusty, bez dublowania wartości
+        doc = parse_bytes(XML_LOTS, "x.xml", record_path="auction")
+        self.assertEqual(doc.context, {})
+        self.assertEqual(len(doc.records), 1)
+
+    def test_publiczne_api_w_trybie_strumieniowym(self):
+        poprzedni = xmlflatten._STREAM_MIN_CHARS
+        xmlflatten._STREAM_MIN_CHARS = 1
+        self.addCleanup(setattr, xmlflatten, "_STREAM_MIN_CHARS", poprzedni)
+        doc = parse_bytes(XML_LOTS, "l.xml")
+        self.assertEqual(doc.record_path, "auction/lots/lot")
+        self.assertEqual(len(doc.records), 3)
+        self.assertEqual(doc.context["auction/title"], "Sprzet IT z likwidacji")
+        self.assertEqual(doc.records[0]["lot@nr"], "1")
+        # jawna ścieżka rekordu też działa bez drzewa
+        doc = parse_bytes(XML_SPECS, "s.xml", record_path="spec")
+        self.assertEqual(len(doc.records), 6)
+
+    def test_duzy_plik_idzie_strumieniowo_i_ma_komplet_wierszy(self):
+        rekord = ("<item nr='%d'><model>T480</model><serial>SN%08d</serial>"
+                  "<grade>B</grade><opis>Sprzet powystawowy, stan dobry</opis></item>")
+        dane = ("<?xml version='1.0' encoding='UTF-8'?><batch auction='A-1'>"
+                "<lot><title>Mix</title><items>"
+                + "".join(rekord % (i, i) for i in range(70000))
+                + "</items></lot></batch>").encode("utf-8")
+        self.assertGreater(len(dane), xmlflatten._STREAM_MIN_CHARS)
+        doc = parse_bytes(dane, "duzy.xml")
+        self.assertEqual(doc.record_path, "batch/lot/items/item")
+        self.assertEqual(len(doc.records), 70000)
+        self.assertEqual(doc.records[0]["serial"], "SN00000000")
+        self.assertEqual(doc.records[-1]["item@nr"], "69999")
+        self.assertEqual(doc.context, {"batch@auction": "A-1", "batch/lot/title": "Mix"})
 
 
 if __name__ == "__main__":

@@ -173,6 +173,15 @@ python3 -m flexit2xlsx build --in xml_flexit --out aukcje.xlsx --repeat index
 # 8. Wymuszenie, co jest "wierszem" w XML-u (gdy automat wybrał źle)
 python3 -m flexit2xlsx build --in xml_flexit --out aukcje.xlsx --record-path item
 
+# 8a. Paczka .zip z XML-ami (albo katalog pełen paczek) — nie trzeba rozpakowywać
+python3 -m flexit2xlsx build --in pakiety.zip --out aukcje.xlsx
+
+# 8b. Ten sam pakiet pobrany dwa razy? Pomiń kopie, żeby nie liczyć sztuk podwójnie
+python3 -m flexit2xlsx build --in xml_flexit --out aukcje.xlsx --skip-duplicates
+
+# 8c. Dodatkowo plik CSV (gdy dane mają iść do innego programu)
+python3 -m flexit2xlsx build --in xml_flexit --out aukcje.xlsx --csv aukcje.csv
+
 # 9. POBIERANIE: tylko lista, nic nie ściągaj (test na sucho)
 python3 -m flexit2xlsx download --out xml_flexit --dry-run
 
@@ -212,6 +221,10 @@ Dalej idą kolumny z XML-a. Nazwa kolumny to ścieżka w dokumencie
 dany plik nie ma, zostają **puste** — dzięki temu pliki o różnych schematach
 mieszczą się w jednej tabeli.
 
+Gdyby kolumn było więcej, niż mieści arkusz Excela (16 384), dane trafiają do
+kolejnych arkuszy `Wszystkie aukcje (2)`, `(3)`… — a trzy kolumny techniczne są
+powtarzane na początku KAŻDEGO z nich, żeby dało się przypisać wiersz do aukcji.
+
 Dodatkowo: nagłówek jest pogrubiony i zamrożony, włączony jest autofiltr,
 a szerokości kolumn są dobrane automatycznie. Liczby, daty i wartości
 logiczne zapisywane są jako **prawdziwe typy Excela**, a nie tekst.
@@ -225,8 +238,23 @@ też tu są — ze statusem `BŁĄD: …`. Ostatni wiersz `RAZEM` podaje sumy.
 ### Arkusze per aukcja (opcja `--per-auction`)
 
 Osobna zakładka dla każdej aukcji, z kolumnami technicznymi `Plik` i `Nr pozycji`.
-Nazwy zakładek są przycinane do 31 znaków (limit Excela) i odróżniane
-przyrostkiem `(2)`, `(3)`… gdy się powtarzają.
+Zakładki są numerowane w kolejności z `Podsumowania` (`01 …`, `02 …`), a nazwy
+dłuższe niż limit Excela (31 znaków) są skracane **w środku**, nie na końcu:
+
+```
+01 flexit-auc…6-2026-numer-0007
+```
+
+Dzięki temu widać końcówkę identyfikatora, czyli tę część, która odróżnia aukcje
+od siebie (samo obcięcie od prawej zostawiało kilkadziesiąt identycznych zakładek
+rozróżnianych tylko przyrostkiem `(2)`, `(3)`…).
+
+### Plik CSV (opcja `--csv`, a także zapis awaryjny)
+
+To samo, co arkusz `Wszystkie aukcje`, w formacie, który otworzy każdy program.
+Przydaje się, gdy dane idą dalej (baza, import do innego systemu) albo gdy `.xlsx`
+z jakiegoś powodu nie chce się otworzyć. Szczegóły — patrz
+[opcje `build`](#build--scalanie-do-xlsx).
 
 ---
 
@@ -239,8 +267,15 @@ przyrostkiem `(2)`, `(3)`… gdy się powtarzają.
 | `--quiet`, `-q` | mniej komunikatów (błędy nadal widać) |
 | `--dry-run` | pokaż, co by się stało, ale niczego nie zapisuj |
 | `--overwrite` | nadpisz istniejące pliki (XML-e przy pobieraniu, `.xlsx` przy budowaniu) |
-| `--version` | numer wersji |
+| `--version` | numer wersji (działa też w każdej podkomendzie: `build --version`) |
 | `--help` | pomoc (działa też dla każdej podkomendy: `build --help`) |
+
+Pomoc i komunikaty o błędach składni są po polsku, np.:
+
+```
+flexit2xlsx: błąd: nieznana podkomenda: 'zbuduj' — dostępne: download, build, all
+flexit2xlsx: błąd: nierozpoznany argument: --outt — sprawdź pisownię (pełna lista opcji: --help)
+```
 
 ### `download` — pobieranie z portalu
 
@@ -254,18 +289,31 @@ przyrostkiem `(2)`, `(3)`… gdy się powtarzają.
 | `--limit N` | pobierz najwyżej N aukcji |
 | `--max-pages N` | ile stron listy przejrzeć (domyślnie 50) |
 | `--max-lots N` | ile lotów w jednej aukcji odwiedzić (domyślnie 200) |
-| `--descend auto\|always\|never` | czy schodzić ze strony aukcji na strony lotów |
+| `--descend auto\|always\|never` | czy schodzić ze strony aukcji na strony lotów (patrz niżej) |
 | `--delay SEKUNDY` | uprzejma przerwa między żądaniami (domyślnie 0.5 s) |
-| `--timeout`, `--retries` | limit czasu i liczba ponowień (domyślnie 30 s, 4 ponowienia) |
+| `--timeout`, `--retries` | limit czasu i liczba ponowień (domyślnie 30 s, 4 ponowienia). `--timeout` dotyczy jednej operacji na gnieździe; cała odpowiedź ma na siebie dziesięciokrotność tego czasu, więc serwer sączący dane po bajcie nie zawiesi programu |
 | `--user-agent TEKST` | własny nagłówek `User-Agent` |
 | `--diagnose` | gdy nic nie znaleziono, wypisz, co właściwie jest na stronie |
+
+**O `--descend`.** Pakiet XML („Download Batch Details”) wisi zwykle poziom niżej
+niż strona aukcji — na stronie pojedynczego lotu.
+
+* `auto` (domyślnie) — program schodzi do lotów **zawsze, gdy strona aukcji ma
+  linki do lotów**, także wtedy, gdy sama dała już jakiś XML (portal potrafi
+  wystawić zbiorczy plik całej aukcji *oraz* osobne pakiety lotów). Powtórzenia
+  odsiewa deduplikacja po hashu lotu i po adresie pliku.
+* `always` — schodzi także wtedy, gdy żadnych stron lotów nie rozpoznano.
+* `never` — zostaje na stronie aukcji (szybko, ale można stracić pakiety lotów).
 
 ### `build` — scalanie do XLSX
 
 | Opcja | Działanie |
 |---|---|
-| `--in SCIEZKA…` | katalog z XML-ami albo pojedyncze pliki (można powtarzać) |
+| `--in SCIEZKA…` | katalog z XML-ami, pojedyncze pliki albo archiwa `.zip` / `.xml.gz` (można powtarzać) |
 | `--out PLIK` | plik wynikowy `.xlsx` (domyślnie `aukcje.xlsx`) |
+| `--csv PLIK` | zapisz DODATKOWO arkusz zbiorczy jako CSV |
+| `--csv-sep ZNAK` | separator pól w CSV (domyślnie `;`) |
+| `--skip-duplicates` | pomiń pliki o treści identycznej z innym plikiem |
 | `--per-auction` | dodatkowy arkusz na każdą aukcję |
 | `--repeat join\|index` | powtarzające się pola: sklej w jedną komórkę (`join`) albo rozbij na `pole[1]`, `pole[2]` (`index`) |
 | `--join-sep TEKST` | czym sklejać przy `--repeat join` (domyślnie ` \| `) |
@@ -281,10 +329,42 @@ się inaczej niż w plikach z wieloma pozycjami. Domyślnie program to naprawia:
 bierze ścieżkę rekordu wykrytą w pozostałych plikach i wczytuje taki plik ponownie,
 żeby kolumny się zgadzały. `--no-unify` wyłącza to zachowanie.
 
+**O archiwach.** Katalog może zawierać paczki `.zip` (albo pojedyncze `.xml.gz`) —
+program sam wyjmuje z nich pliki `.xml` do katalogu tymczasowego i traktuje jak
+zwykłe wejście; po zakończeniu pracy nic po nich nie zostaje. Nazwa w kolumnie
+`Plik` niesie ślad pochodzenia (`pakiety__loty_lot_e0c8f.xml`), więc zawsze wiadomo,
+z której paczki pochodzi wiersz. Paczka z paczkami (jedna na lot) też jest
+obsłużona — do dwóch poziomów zagnieżdżenia. Archiwum zabezpieczone hasłem trzeba
+rozpakować samodzielnie — program nie zna hasła i powie o tym wprost.
+
+**O powtórzonych plikach.** Ten sam pakiet bywa na portalu pod dwoma adresami,
+łatwo więc pobrać go dwa razy pod różnymi nazwami. Wtedy te same sztuki policzyłyby
+się podwójnie — a w arkuszu nie byłoby tego widać. Program porównuje pliki
+(najpierw rozmiar, potem suma kontrolna) i **ostrzega**; `--skip-duplicates` każe
+mu pominąć kopie. Domyślnie nic nie jest usuwane bez Twojej decyzji.
+
+**O `--csv`.** Plik CSV zawiera dokładnie to, co arkusz `Wszystkie aukcje`. Jest
+zapisany w UTF-8 z BOM i ze średnikiem jako separatorem, więc polski Excel otwiera
+go dwuklikiem, z poprawnymi ogonkami (dla angielskiej wersji Excela użyj
+`--csv-sep ,`). Wartości zaczynające się od `=`, `+`, `-` lub `@` dostają apostrof —
+Excel nie potraktuje ich jak formuły. Jeżeli zapis `.xlsx` się **nie powiedzie**
+(brak miejsca, plik otwarty w Excelu, błąd zapisu), program **sam** zapisze dane
+do CSV obok pliku wynikowego i napisze gdzie — praca nie przepada.
+
 ### `all` — pobierz i zbuduj
 
-Przyjmuje wszystkie opcje obu powyższych. Uwaga na znaczenie ścieżek:
-`--in` to **katalog na pobrane XML-e**, a `--out` to **plik `.xlsx`**.
+Przyjmuje wszystkie opcje obu powyższych. Dwie rzeczy znaczą tu co innego niż
+w podkomendach osobno:
+
+* **ścieżki**: `--in` to **katalog na pobrane XML-e**, a `--out` to **plik `.xlsx`**;
+* **`--limit N` ogranicza liczbę AUKCJI** (jak w `download`), a **nie** liczbę
+  plików XML (jak w `build`). `all --limit 3` weźmie trzy aukcje — a te mogą mieć
+  po kilkanaście pakietów każda. Gdy chcesz ograniczyć liczbę PLIKÓW, pobierz
+  osobno (`download --limit 1`), a potem `build --limit 3`.
+
+Zanim `all` wyśle pierwsze żądanie do portalu, sprawdza plik z `--out`: jeżeli
+istnieje, a nie podano `--overwrite`, kończy się od razu (kod 1) — żeby
+kilkunastominutowe pobieranie nie poszło na marne.
 
 ---
 
@@ -333,7 +413,8 @@ python3 -m flexit2xlsx download --out xml_flexit \
 ### Krok 3. Zmuś program, żeby zszedł do lotów
 
 XML „Download Batch Details” bywa dopiero na stronie pojedynczego lotu, nie na
-stronie aukcji:
+stronie aukcji. Domyślne `--descend auto` schodzi tam samo, gdy rozpozna linki
+do lotów; gdy ich układ jest nietypowy, wymuś zejście:
 
 ```bash
 python3 -m flexit2xlsx download --out xml_flexit --descend always --limit 1
@@ -349,6 +430,8 @@ python3 -m flexit2xlsx download --out xml_flexit --descend always --limit 1
 2. Kliknij przycisk **„Download Batch Details”** (albo inny odnośnik do XML-a).
 3. Zapisz wszystkie pliki `.xml` do jednego katalogu, np. `xml_flexit`.
    Nazwy plików mogą być dowolne — program i tak wypisze je w kolumnie `Plik`.
+   Jeżeli portal oddaje **paczkę `.zip`**, wrzuć ją do tego katalogu bez
+   rozpakowywania — `build` sam wyjmie z niej pliki XML.
 4. Uruchom scalanie:
 
    ```bash
@@ -370,6 +453,9 @@ python3 -m flexit2xlsx download --out xml_flexit --descend always --limit 1
   i wskaż inną przez `--record-path`.
 * **Excel psuje numery seryjne albo kody** (np. `007` → `7`, długie numery →
   notacja wykładnicza) — użyj `--no-typing`.
+* **„Pomijam plik.xml — to strona HTML, a nie XML”** — przeglądarka zapisała
+  stronę logowania zamiast pliku (wygasła sesja portalu). Zaloguj się jeszcze raz
+  i pobierz plik ponownie albo użyj `download --cookie "..."`.
 
 ---
 
@@ -378,6 +464,12 @@ python3 -m flexit2xlsx download --out xml_flexit --descend always --limit 1
 Portal może wymagać zalogowania, żeby wydać plik z zawartością pakietu. Program
 **nie umie się logować sam** (nie wysyła formularzy), ale potrafi korzystać
 z sesji, którą już otworzyłeś w przeglądarce.
+
+Ciasteczko z `--cookie` jest **sklejane** z ciasteczkami, które portal ustawia
+w trakcie pracy (token CSRF, `cf_clearance`) — wracają na serwer razem. Końcowy
+znak nowej linii, który łatwo skopiować razem z wartością, jest po cichu obcinany;
+znak końca linii **w środku** wartości kończy się czytelnym błędem, bo oznaczałby
+próbę wstrzyknięcia nagłówka HTTP.
 
 ### Jak skopiować ciasteczko — Chrome / Edge
 
@@ -433,12 +525,16 @@ Przydatne, gdy uruchamiasz narzędzie z innego skryptu:
 | `python3: command not found` / `py nie jest rozpoznawane` | Python nie jest zainstalowany albo nie ma go w PATH — patrz instrukcje wyżej |
 | `No module named flexit2xlsx` | jesteś w złym katalogu; wejdź (`cd`) do katalogu, w którym leży podkatalog `flexit2xlsx` |
 | `Plik aukcje.xlsx już istnieje` | dodaj `--overwrite` albo podaj inną nazwę w `--out` |
-| `Nie znalazłem żadnego pliku .xml` | sprawdź ścieżkę po `--in`; pliki muszą mieć rozszerzenie `.xml` |
+| `Nie znalazłem żadnego pliku .xml` | sprawdź ścieżkę po `--in`; pliki muszą mieć rozszerzenie `.xml` (albo być w paczce `.zip` / `.gz`) |
+| `to archiwum ZIP zapisane pod nazwą .xml` | zmień rozszerzenie pliku na `.zip` — program sam go rozpakuje |
+| Excel nie chce otworzyć wyniku / zapis się nie udał | program zapisał dane awaryjnie do pliku `.csv` obok — nazwa jest w komunikacie; możesz też od razu użyć `--csv` |
+| Podejrzanie dużo pozycji, sztuki się dublują | to zwykle ten sam pakiet pobrany dwa razy — program o tym ostrzega; użyj `--skip-duplicates` |
 | `Nie znalazłem żadnej aukcji` | patrz [rozdział o braku aukcji](#gdy-skrypt-nie-znajduje-aukcji-lub-xml-i) |
 | `Treść spod … nie jest XML-em` | portal zwrócił stronę logowania — użyj `--cookie` |
 | Excel: „plik jest uszkodzony” | zgłoś to jako błąd; spróbuj też `--no-typing` i innej nazwy pliku wyjściowego |
 | Polskie znaki wyglądają źle | otwórz plik `.xlsx` (nie CSV) w Excelu — kodowanie jest w środku i zawsze jest UTF-8 |
 | Bardzo dużo wierszy | powyżej 1 048 576 wierszy program sam dzieli dane na kolejne arkusze i ostrzega o tym |
+| Program wygląda, jakby się zawiesił | przy wczytywaniu widać licznik `[12/300]`, przy zapisie — `... zapisano N wierszy`; jeśli nie widzisz nic, uruchomiłeś go z `--quiet` |
 
 ---
 
@@ -461,14 +557,36 @@ SITE_NOTES.md      co wiadomo o portalu (i skąd)
 ### Testy
 
 ```bash
-python3 -m unittest discover -s tests           # cały zestaw
-python3 -m unittest discover -s tests -v        # z nazwami testów
-python3 -m unittest tests.test_cli              # jeden moduł
+python3 -m unittest discover -s tests -p 'test_*.py'   # zestaw podstawowy
+python3 -m unittest discover -s tests -p 'test_*.py' -v  # z nazwami testów
+python3 -m unittest tests.test_cli                     # jeden moduł
 ```
+
+**Uwaga: `discover` NIE wchodzi do `tests/adversarial/`.** Ten podkatalog nie ma
+pliku `__init__.py`, a wyszukiwanie testów pomija takie katalogi po cichu — bez
+tego ostrzeżenia łatwo wziąć „OK” za komplet. Testy adwersaryjne uruchamia się
+po nazwie modułu:
+
+```bash
+python3 -m unittest tests.adversarial.test_scraper
+python3 -m unittest tests.adversarial.test_bezpieczenstwo
+python3 -m unittest tests.adversarial.test_brudny_xml
+python3 -m unittest tests.adversarial.test_poprawnosc_xlsx
+python3 -m unittest tests.adversarial.test_skala
+python3 -m unittest tests.adversarial.test_ux_dokumentacja
+```
+
+Testy adwersaryjne to osobny gatunek: ich nazwy `test_blad_*` / `test_USTERKA_*`
+**utrwalają zachowanie zaobserwowane w chwili audytu**, a nie zachowanie
+docelowe. Po naprawieniu opisanej w nich usterki taki test przestaje przechodzić
+— i tak właśnie ma być; opis „jak być powinno” jest w jego docstringu. Testy
+`test_ok_*` z tych samych plików pilnują braku regresji i muszą być zielone.
 
 Testy używają `openpyxl` i `lxml` do **niezależnej weryfikacji** wyników — sam
 program ich nie potrzebuje. Część sieciowa jest testowana przeciwko atrapie
-portalu (`tests/mocksite`, serwer `http.server` na losowym porcie).
+portalu (`tests/mocksite`, serwer `http.server` na losowym porcie) oraz —
+w testach regresji — przeciwko własnemu serwerowi na surowym gnieździe TCP
+(obcięty `Content-Length`, gzip wbrew negocjacji, sączenie po bajcie).
 
 ### Wymuszenie sposobu zapisu XLSX
 
@@ -499,11 +617,31 @@ xlsxwrite.write_workbook("aukcje.xlsx", cli.build_sheets(docs, errors))
   scraper przeszuka jeszcze osadzony JSON (`__NEXT_DATA__` i podobne), ale nie zawsze
   to wystarczy.
 * **Brak równoległego pobierania** — świadomie, żeby nie obciążać portalu.
+* **`download` szuka XML-i, nie archiwów.** Gdyby portal oddawał zawartość pakietu
+  jako `.zip`, pobieranie go nie znajdzie (linki do archiwów są celowo pomijane) —
+  wtedy pobierz paczki ręcznie i użyj `build`, który archiwa rozpakowuje sam.
+* **Za witrynę portalu uznajemy dokładnie jego host i prawdziwe poddomeny**
+  (`media.flexitauctions.com`) przy zgodnym porcie. Link albo przekierowanie
+  gdziekolwiek indziej jest blokowane — dzięki temu ciasteczko z `--cookie` nigdy
+  nie trafi do obcego serwisu. Jeśli portal serwuje pliki z zupełnie innej domeny,
+  trzeba je pobrać ręcznie i użyć `build`.
+* **Zużycie pamięci zależy od NAJWIĘKSZEGO pliku XML, nie od sumy wszystkich.**
+  Powyżej ok. 100 000 wczytanych wierszy program zwalnia dane z pamięci i parsuje
+  pliki ponownie w chwili zapisu (arkusz i tak powstaje strumieniowo). Kosztem
+  jest drugi odczyt z dysku; zyskiem — możliwość zbudowania arkusza z korpusu
+  większego niż pamięć komputera. Gdy pojedynczy plik i tak się nie mieści,
+  program pomija JEGO JEDEN i kończy kodem 3, wpisując powód do `Podsumowania`.
+* Odpowiedzi spakowane przez serwer (`Content-Encoding: gzip`/`deflate`) są
+  rozpakowywane, a pliki XML w UTF-16/UTF-32 (typowe dla eksportów z Windows)
+  rozpoznawane po BOM-ie — nie trzeba nic ustawiać.
 * Jeden dokument XML daje **jedną tabelę**; gdy plik zawiera dwie niezależne listy,
   wybrana zostanie ta, która wygląda na główną.
 * Rozpoznawanie typów jest **ostrożne**: `"16 GB"`, `"1.2.3"`, `"007"` i numery
-  telefonów zostają tekstem. Wartości takie jak `"1,234"` traktowane są po polsku
-  (jeden przecinek = separator dziesiętny).
+  telefonów zostają tekstem. Zapis niejednoznaczny — jeden separator i dokładnie
+  trzy cyfry po nim, np. `"1,234"` albo `"1.234"` — też **zostaje tekstem**, bo
+  po polsku znaczy 1,234, a po angielsku 1234; zgadywanie mogłoby zaniżyć kwotę
+  tysiąckrotnie. Jednoznaczne zapisy (`"1 234,56"`, `"1,234.56"`, `"1234.56"`)
+  są zamieniane na liczby.
 * Otwarcie wyniku w Excelu i LibreOffice **należy potwierdzić lokalnie** — środowisko,
   w którym powstał kod, nie miało zainstalowanego arkusza kalkulacyjnego. Poprawność
   formatu OOXML jest sprawdzana w testach na poziomie struktury pliku i przez `openpyxl`.

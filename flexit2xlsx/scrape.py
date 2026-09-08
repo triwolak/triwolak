@@ -20,28 +20,46 @@ Podjęte decyzje projektowe (przypadki niejednoznaczne)
   ``opener.sleep`` (parametr ``sleep=`` w :func:`make_opener`), a domyślnie przez
   modułową funkcję :data:`SLEEP_FUNCTION`.  Testy nigdy nie śpią naprawdę.
 * **Granica "tej samej witryny".**  Linki spoza witryny są odrzucane BEZ żądania
-  sieciowego.  Za tę samą witrynę uznajemy równy host albo równą domenę
-  rejestrowalną przybliżoną dwiema ostatnimi etykietami — dzięki temu działa
-  ``media.flexitauctions.com`` przy bazie ``flexitauctions.com``, a
-  ``evil.example.com`` jest odrzucane.  Dla adresów IP wymagana jest równość
-  hosta ORAZ portu (inny port = inne źródło).  Przekierowanie poza witrynę
-  przerywa żądanie (:class:`SiteBlockedError`) — inaczej wyciekłoby ciasteczko.
+  sieciowego.  Za tę samą witrynę uznajemy DOKŁADNIE ten sam host albo jego
+  prawdziwą poddomenę (``media.flexitauctions.com`` przy bazie
+  ``flexitauctions.com``) przy zgodnym porcie.  Heurystyki "dwie ostatnie
+  etykiety domeny" świadomie NIE używamy: dla sufiksów ``co.uk``, ``com.pl``,
+  ``gov.pl`` czy ``github.io`` uznawała obce witryny za swoje i wyciekało tamtędy
+  ciasteczko sesyjne.  Przekierowanie poza witrynę przerywa żądanie
+  (:class:`SiteBlockedError`).
+* **Ciasteczka.**  Statyczne ``--cookie`` jest SKLEJANE z zawartością
+  ``http.cookiejar`` (jar ma pierwszeństwo), a nie wstawiane zamiast niej —
+  inaczej token CSRF/``cf_clearance`` przysłany przez portal nigdy by nie wrócił.
+* **Integralność odpowiedzi.**  Po odczycie porównujemy długość treści z
+  ``Content-Length`` (CPython świadomie nie zgłasza tu ``IncompleteRead``),
+  rozpakowujemy ``Content-Encoding: gzip``/``deflate`` i pilnujemy terminu CAŁEJ
+  odpowiedzi (``timeout * RESPONSE_TIMEOUT_FACTOR``), bo timeout gniazda dotyczy
+  tylko pojedynczej operacji.
 * **Schematy inne niż http/https** (``file:``, ``javascript:``, ``data:``,
   ``mailto:``) są odrzucane już na etapie wyciągania linków.
-* **Zejście do lotów** (``descend="auto"``) następuje tylko wtedy, gdy strona
-  aukcji sama nie dała żadnego XML-a.  Portal może linkować XML na obu
-  poziomach, a "auto" nie generuje setek zbędnych żądań.
+* **Zejście do lotów** (``descend="auto"``) następuje zawsze, gdy strona aukcji
+  ma linki do stron lotów — także wtedy, gdy sama dała już jakiś XML (portal
+  potrafi wystawić zbiorczy plik aukcji ORAZ osobne pakiety lotów).  Inaczej
+  jeden zbiorczy plik ukrywałby wszystkie loty.  ``descend="never"`` wyłącza
+  schodzenie, ``descend="always"`` schodzi nawet bez rozpoznanych stron lotów.
 * **Sondowanie Content-Type** dotyczy tylko linków NIEPEWNYCH (przycisk
   "Download Batch Details" bez rozszerzenia).  Budżet sond jest ograniczony
-  (``probe_limit``), a wynik cache'owany w openerze, żeby nie odpytywać dwa razy
-  tego samego adresu.
+  (``probe_limit``), a w openerze cache'owany jest zarówno werdykt, jak i sama
+  TREŚĆ (do ``PROBE_CACHE_MAX_BYTES``) — dzięki temu ``download_xml`` nie pobiera
+  tego samego pliku drugi raz.  Werdykt zapada po obejrzeniu treści, a nie tylko
+  nagłówka, bo endpointy eksportu często zwracają XML jako ``text/html``.
 * **Nazwy plików** są sprowadzane do ASCII ``[A-Za-z0-9_.-]`` (a nie do
-  unicode'owego ``\\w``), bo plik ma być przenośny między systemami plików.
+  unicode'owego ``\\w``), bo plik ma być przenośny między systemami plików —
+  ale litery spoza ASCII są TRANSLITEROWANE (``zawartość`` -> ``zawartosc``),
+  a nie kasowane, żeby nazwa dalej identyfikowała lot.
   Zawsze brana jest sama nazwa bazowa — ``../../etc/passwd`` daje ``passwd``.
 * **Pobrany plik, który jest stroną HTML** (ściana logowania) to błąd
   :class:`NotXmlError`, a nie "pobrany plik".  Inaczej śmieć wylądowałby w
   katalogu wyjściowym i przy kolejnym uruchomieniu zostałby POMINIĘTY jako
   "już pobrany".
+* **Tekst z portalu nigdy nie steruje terminalem.**  Identyfikatory, tytuły,
+  raport ``--diagnose`` i wszystkie ostrzeżenia przechodzą przez
+  :func:`strip_controls` (bez ``\\x1b[2J``, OSC i reszty C0/C1).
 * **Błąd sieci przy PIERWSZEJ stronie listy** jest wyjątkiem (użytkownik musi
   wiedzieć, że portal nie odpowiada), przy kolejnych stronach paginacji — tylko
   ostrzeżeniem.  Brak DOPASOWAŃ to zawsze pusta lista, nigdy wyjątek.
@@ -49,6 +67,7 @@ Podjęte decyzje projektowe (przypadki niejednoznaczne)
 
 from __future__ import annotations
 
+import gzip
 import hashlib
 import http.client
 import http.cookiejar
@@ -58,9 +77,11 @@ import re
 import socket
 import sys
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
+import zlib
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from typing import Any, Callable, Optional
@@ -89,8 +110,10 @@ __all__ = [
     "DEFAULT_DELAY",
     "BACKOFF_BASE",
     "MAX_BACKOFF",
+    "RESPONSE_TIMEOUT_FACTOR",
     "RETRY_STATUSES",
     "SLEEP_FUNCTION",
+    "strip_controls",
 ]
 
 # ---------------------------------------------------------------------------
@@ -113,6 +136,17 @@ DEFAULT_AUCTION_RE = r"/auction/(?P<id>[^/?#]+)/?(?:info/?)?$"
 BACKOFF_BASE = 2.0
 BACKOFF_FACTOR = 2.0
 MAX_BACKOFF = 60.0
+
+#: Ile razy dłużej niż ``timeout`` wolno trwać CAŁEJ odpowiedzi.
+#:
+#: ``timeout`` gniazda ogranicza tylko POJEDYNCZĄ operację odczytu, więc serwer
+#: sączący dane po bajcie potrafi trzymać połączenie dowolnie długo.  Dlatego
+#: całą odpowiedź obejmuje osobny termin: ``timeout * RESPONSE_TIMEOUT_FACTOR``.
+RESPONSE_TIMEOUT_FACTOR = 10.0
+
+#: Ile najwyżej bajtów z sondy ``Content-Type`` zapamiętać, żeby nie pobierać
+#: tego samego pliku drugi raz (większe pliki pobieramy ponownie — pamięć ważniejsza).
+PROBE_CACHE_MAX_BYTES = 8 * 1024 * 1024
 
 #: Uprzejme opóźnienie między kolejnymi żądaniami (sekundy).
 DEFAULT_DELAY = 0.5
@@ -242,9 +276,32 @@ class XmlRef:
 # ---------------------------------------------------------------------------
 
 
+#: Znaki sterujące C0/C1 (bez ``\t``, ``\n``, ``\r``), którymi obca strona mogłaby
+#: sterować terminalem użytkownika: czyścić ekran (``\x1b[2J``), zmieniać tytuł
+#: okna (OSC), mrugać, przestawiać kolory.  Treść z portalu NIGDY nie trafia na
+#: konsolę w surowej postaci.
+_CONTROL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def strip_controls(text: Optional[str]) -> str:
+    """Usuwa znaki sterujące terminala z tekstu pochodzącego z portalu.
+
+    Zostawia spację, tabulator i znak nowej linii (te i tak zwijamy dalej),
+    a wycina wszystko, czym da się sterować terminalem.
+    """
+    if not text:
+        return ""
+    return _CONTROL_RE.sub("", str(text))
+
+
 def _warn(message: str, *, stream=None) -> None:
-    """Wypisuje ostrzeżenie na ``stderr`` (rozwiązywany w momencie wywołania)."""
-    print("[scrape] " + message, file=stream if stream is not None else sys.stderr)
+    """Wypisuje ostrzeżenie na ``stderr`` (rozwiązywany w momencie wywołania).
+
+    Komunikat przechodzi przez :func:`strip_controls`, bo bardzo często zawiera
+    adres albo fragment treści pobranej z obcej strony.
+    """
+    print("[scrape] " + strip_controls(message),
+          file=stream if stream is not None else sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -289,7 +346,9 @@ def absolutize(base_url: str, href: Optional[str]) -> Optional[str]:
     """
     if not href:
         return None
-    href = href.strip().replace("\n", "").replace("\r", "").replace("\t", "")
+    # znaki sterujące (także \x1b, którym da się sterować terminalem) w adresie
+    # są niepoprawne wg RFC 3986 — wycinamy je, zamiast nieść dalej na konsolę
+    href = strip_controls(href).strip().replace("\n", "").replace("\t", "")
     if not href or href.startswith("#"):
         return None
     low = href.lower()
@@ -318,40 +377,63 @@ def _is_ip_literal(host: str) -> bool:
     return bool(re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", host))
 
 
-def _registrable(host: str) -> str:
-    """Przybliżenie domeny rejestrowalnej: dwie ostatnie etykiety."""
-    labels = [p for p in host.split(".") if p]
-    if len(labels) <= 2:
-        return ".".join(labels)
-    return ".".join(labels[-2:])
+def _bare_host(host: str) -> str:
+    """Host bez wiodącego ``www.`` — apex i ``www`` to w praktyce ta sama witryna."""
+    host = (host or "").lower().strip(".")
+    return host[4:] if host.startswith("www.") else host
+
+
+def _same_port(a, b) -> bool:
+    """Czy dwa adresy mają to samo źródło pod względem portu?
+
+    Porty porównujemy dla WSZYSTKICH hostów (nie tylko literałów IP), bo
+    ``http://intranet:9200`` to inne źródło niż ``http://intranet:8080``.
+    Wyjątkiem jest sytuacja, w której żadna strona nie podała portu jawnie —
+    wtedy ``http`` i ``https`` pod tym samym hostem uznajemy za tę samą witrynę
+    (portal potrafi mieszać oba schematy w linkach).
+    """
+    default = {"http": 80, "https": 443}
+    try:
+        pa, pb = a.port, b.port
+    except ValueError:
+        return False
+    if pa is None and pb is None:
+        return True
+    return (pa or default.get(a.scheme.lower())) == (pb or default.get(b.scheme.lower()))
 
 
 def is_same_site(base_url: str, url: str) -> bool:
     """Czy ``url`` należy do tej samej witryny co ``base_url``?
 
-    Poddomeny tej samej domeny są akceptowane (``media.flexitauctions.com``),
-    obce domeny nie.  Dla adresów IP wymagana jest zgodność hosta i portu.
+    Porównanie jest ŚCISŁE: ten sam host albo jego prawdziwa poddomena
+    (``media.flexitauctions.com`` przy bazie ``flexitauctions.com``) oraz ten sam
+    port.  Świadomie NIE używamy heurystyki "dwie ostatnie etykiety domeny" —
+    dla sufiksów wieloczłonowych (``co.uk``, ``com.pl``, ``gov.pl``,
+    ``github.io``) uznawała ona zupełnie obce witryny za tę samą domenę, a
+    ponieważ ten sam predykat pilnuje przekierowań, wyciekłoby tamtędy
+    ciasteczko sesyjne podane w ``--cookie``.
+
+    Gdy potrzebny jest inny host (np. CDN pod własną domeną), trzeba go podać
+    jawnie jako ``site=`` przy budowie openera.
     """
     try:
         a = urllib.parse.urlsplit(base_url)
         b = urllib.parse.urlsplit(url)
         ha, hb = (a.hostname or "").lower(), (b.hostname or "").lower()
-        pa, pb = a.port, b.port
     except ValueError:
         return False
     if b.scheme.lower() not in ("http", "https"):
         return False
     if not ha or not hb:
         return False
-    da = {"http": 80, "https": 443}.get(a.scheme.lower())
-    db = {"http": 80, "https": 443}.get(b.scheme.lower())
-    if ha == hb:
-        if _is_ip_literal(ha):
-            return (pa or da) == (pb or db)
-        return True
-    if _is_ip_literal(ha) or _is_ip_literal(hb):
+    if not _same_port(a, b):
         return False
-    return bool(_registrable(ha)) and _registrable(ha) == _registrable(hb)
+    if _is_ip_literal(ha) or _is_ip_literal(hb):
+        return ha == hb
+    base_host, target_host = _bare_host(ha), _bare_host(hb)
+    if not base_host or not target_host:
+        return False
+    return target_host == base_host or target_host.endswith("." + base_host)
 
 
 # ---------------------------------------------------------------------------
@@ -364,6 +446,29 @@ _RESERVED_NAMES = frozenset(
     + ["com%d" % i for i in range(1, 10)]
     + ["lpt%d" % i for i in range(1, 10)]
 )
+
+
+#: Litery, których rozkład unicode (NFKD) nie zdejmuje znaku diakrytycznego —
+#: bez tej tabelki ``ł`` zniknęłoby bez śladu i z ``ł ą ż.xml`` zostałoby ``xml``.
+_TRANSLIT = {
+    "ł": "l", "Ł": "L", "ø": "o", "Ø": "O", "đ": "d", "Đ": "D", "ð": "d", "Ð": "D",
+    "ß": "ss", "æ": "ae", "Æ": "AE", "œ": "oe", "Œ": "OE", "þ": "th", "Þ": "TH",
+    "ı": "i", "ħ": "h", "Ħ": "H", "ŧ": "t", "Ŧ": "T", "№": "N",
+}
+
+
+def _to_ascii(text: str) -> str:
+    """Sprowadza tekst do ASCII, ZACHOWUJĄC litery (transliteracja, nie kasowanie).
+
+    ``zawartość pakietu`` -> ``zawartosc pakietu``, ``ł ą ż`` -> ``l a z``.
+    Dzięki temu nazwa pliku dalej identyfikuje lot, a jednocześnie jest
+    przenośna między systemami plików (kontrakt dopuszcza ``[\\w.-]``, ale
+    ``\\w`` w nazwie pliku bywa kłopotliwe na obcych systemach).
+    """
+    text = "".join(_TRANSLIT.get(ch, ch) for ch in text)
+    decomposed = unicodedata.normalize("NFKD", text)
+    without_marks = "".join(ch for ch in decomposed if not unicodedata.combining(ch))
+    return without_marks.encode("ascii", "ignore").decode("ascii")
 
 
 def _cap_name(stem: str, ext: str) -> str:
@@ -381,6 +486,8 @@ def safe_filename(name: Optional[str], *, default: str = "plik.xml",
 
     * bierze wyłącznie nazwę bazową (``../../etc/passwd`` -> ``passwd``),
       rozumiejąc oba rodzaje separatorów i procentowe kodowanie,
+    * litery spoza ASCII TRANSLITERUJE (``zawartość`` -> ``zawartosc``),
+      żeby nazwa dalej identyfikowała plik,
     * dopuszcza tylko ASCII ``[A-Za-z0-9_.-]``, resztę zamienia na ``_``,
     * usuwa wiodące kropki i ciągi ``..`` (brak path traversal, brak plików ukrytych),
     * pilnuje długości i nazw zarezerwowanych w Windows,
@@ -398,13 +505,14 @@ def safe_filename(name: Optional[str], *, default: str = "plik.xml",
     text = text.replace("\\", "/")
     text = text.split("?", 1)[0].split("#", 1)[0]
     base = posixpath.basename(text).strip()
+    base = _to_ascii(base)
     base = re.sub(r"[^A-Za-z0-9_.-]", "_", base, flags=re.ASCII)
     base = re.sub(r"_{2,}", "_", base)           # bez ciągów podkreśleń
     base = re.sub(r"\.{2,}", ".", base)          # ".." nie przetrwa
     base = base.strip("._-")
     if not base:
         base = default or "plik.xml"
-        base = re.sub(r"[^A-Za-z0-9_.-]", "_", base, flags=re.ASCII).strip("._-")
+        base = re.sub(r"[^A-Za-z0-9_.-]", "_", _to_ascii(base), flags=re.ASCII).strip("._-")
         if not base:
             base = "plik.xml"
     stem, ext = posixpath.splitext(base)
@@ -479,6 +587,67 @@ def _default_sleep(seconds: float) -> None:
     SLEEP_FUNCTION(seconds)
 
 
+def _merge_cookie_header(have: str, static: str) -> str:
+    """Skleja ciasteczka z jara (``have``) ze statycznym ``--cookie``.
+
+    Wartości z jara mają PIERWSZEŃSTWO (są świeższe — portal właśnie je przysłał),
+    a ze statycznego ciasteczka dokładamy tylko te pary, których w jarze nie ma.
+    """
+    have = (have or "").strip()
+    static = (static or "").strip()
+    if not static:
+        return have
+    if not have:
+        return static
+    names = set()
+    for pair in have.split(";"):
+        name = pair.split("=", 1)[0].strip().lower()
+        if name:
+            names.add(name)
+    extra = []
+    for pair in static.split(";"):
+        chunk = pair.strip()
+        if not chunk:
+            continue
+        name = chunk.split("=", 1)[0].strip().lower()
+        if name and name in names:
+            continue
+        names.add(name)
+        extra.append(chunk)
+    if not extra:
+        return have
+    return "; ".join([have] + extra)
+
+
+class _SessionCookieProcessor(urllib.request.HTTPCookieProcessor):
+    """Dokłada ciasteczka z jara, a POTEM statyczne ciasteczko z ``--cookie``.
+
+    Bez tego statyczny nagłówek ``Cookie`` (ustawiany dawniej wprost w
+    :meth:`Opener.headers`) unieważniał cały ``http.cookiejar``:
+    ``CookieJar.add_cookie_header`` dokłada ciasteczka sesji WYŁĄCZNIE wtedy,
+    gdy żądanie nagłówka ``Cookie`` jeszcze nie ma.  Efekt był taki, że token
+    CSRF / ``cf_clearance`` przysłany przez portal nigdy nie wracał — czyli
+    dokładnie w scenariuszu, dla którego ``--cookie`` powstało, sesja bywała
+    niekompletna.
+
+    Handler działa też po przekierowaniu (urllib przepuszcza nowe żądanie przez
+    ten sam łańcuch), więc ciasteczko nie gubi się po ``302``.
+    """
+
+    owner: Optional["Opener"] = None
+
+    def http_request(self, request):  # noqa: D102
+        request = super().http_request(request)
+        static = (getattr(self.owner, "cookie", None) or "") if self.owner else ""
+        if static:
+            merged = _merge_cookie_header(request.get_header("Cookie", "") or "", static)
+            if merged:
+                request.add_unredirected_header("Cookie", merged)
+        return request
+
+    https_request = http_request
+
+
 class _GuardedRedirectHandler(urllib.request.HTTPRedirectHandler):
     """Blokuje przekierowania poza witrynę (ochrona ciasteczka sesyjnego)."""
 
@@ -524,12 +693,18 @@ class Opener:
     #: Ostatnio pobrana strona HTML: ``(url, dane, content_type)`` — dla diagnostyki.
     last_page: Optional[tuple] = None
     _ctype_cache: dict = field(default_factory=dict)
+    #: Treść pobrana w sondzie ``Content-Type``: ``{url: (dane, content_type)}``.
+    _probe_bodies: dict = field(default_factory=dict)
     _last_request_at: Optional[float] = None
 
     # -- pomocnicze ---------------------------------------------------------
 
     def headers(self) -> dict:
-        """Nagłówki wysyłane z każdym żądaniem."""
+        """Nagłówki wysyłane z każdym żądaniem (BEZ ``Cookie``).
+
+        Ciasteczka dokłada :class:`_SessionCookieProcessor` — najpierw z jara,
+        potem statyczne z ``--cookie`` — żeby jedno nie wypierało drugiego.
+        """
         head = {
             "User-Agent": self.user_agent,
             "Accept": (
@@ -537,12 +712,11 @@ class Opener:
                 "text/xml;q=0.9,*/*;q=0.8"
             ),
             "Accept-Language": "pl,en;q=0.8",
-            # urllib nie umie sam rozpakować gzip — prosimy o brak kompresji
+            # prosimy o brak kompresji, ale i tak umiemy rozpakować gzip/deflate
+            # (Cloudflare i nginx z gzip_static bywają głuche na tę prośbę)
             "Accept-Encoding": "identity",
             "Connection": "close",
         }
-        if self.cookie:
-            head["Cookie"] = self.cookie
         head.update(self.extra_headers or {})
         return head
 
@@ -579,6 +753,34 @@ class Opener:
         return min(MAX_BACKOFF, BACKOFF_BASE * (BACKOFF_FACTOR ** attempt))
 
 
+def _clean_header_value(value: Optional[str], what: str) -> Optional[str]:
+    """Przycina wartość nagłówka i odrzuca taką, która łamie protokół.
+
+    Kopiowanie ciasteczka z DevTools/pliku bardzo często dokleja końcowy znak
+    nowej linii.  ``http.client`` odrzuca taki nagłówek surowym ``ValueError``
+    ("Invalid header value"), a wcześniej nikt go nie łapał — użytkownik dostawał
+    ścianę tekstu zamiast wskazówki.  Białe znaki z brzegów obcinamy sami, a gdy
+    w środku dalej siedzi ``\\r``/``\\n`` (próba wstrzyknięcia nagłówka) —
+    zgłaszamy czytelny :class:`ScrapeError`.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if "\r" in text or "\n" in text:
+        raise ScrapeError(
+            "Wartość %s zawiera znak końca linii — usuń go (przy kopiowaniu z "
+            "przeglądarki łatwo zabrać nadmiarowy Enter) i spróbuj ponownie." % what
+        )
+    if _CONTROL_RE.search(text):
+        raise ScrapeError(
+            "Wartość %s zawiera znaki sterujące, których nie wolno wysłać w "
+            "nagłówku HTTP — wklej ją jeszcze raz." % what
+        )
+    return text
+
+
 def make_opener(*, user_agent: str = DEFAULT_USER_AGENT, cookie: Optional[str] = None,
                 timeout: float = 30.0, retries: int = 4,
                 delay: float = DEFAULT_DELAY,
@@ -598,12 +800,16 @@ def make_opener(*, user_agent: str = DEFAULT_USER_AGENT, cookie: Optional[str] =
     :param site: adres witryny, poza którą nie wolno wyjść; gdy pominięty,
         opener przypina się do pierwszego pobieranego adresu.
     """
+    cookie = _clean_header_value(cookie, "--cookie")
+    user_agent = _clean_header_value(user_agent, "--user-agent") or DEFAULT_USER_AGENT
+    clean_extra = {}
+    for key, value in (extra_headers or {}).items():
+        clean_extra[key] = _clean_header_value(value, "nagłówek %s" % key)
+
     jar = http.cookiejar.CookieJar()
     redirect = _GuardedRedirectHandler()
-    director = urllib.request.build_opener(
-        urllib.request.HTTPCookieProcessor(jar),
-        redirect,
-    )
+    cookies = _SessionCookieProcessor(jar)
+    director = urllib.request.build_opener(cookies, redirect)
     # build_opener dokleja własny User-Agent — usuwamy, nagłówki dajemy sami
     director.addheaders = []
     opener = Opener(
@@ -616,7 +822,7 @@ def make_opener(*, user_agent: str = DEFAULT_USER_AGENT, cookie: Optional[str] =
         max_bytes=int(max_bytes),
         site=_normalize_url(site) if site else None,
         diagnose=bool(diagnose),
-        extra_headers=dict(extra_headers or {}),
+        extra_headers=clean_extra,
         cookie_jar=jar,
     )
     if sleep is not None:
@@ -624,6 +830,7 @@ def make_opener(*, user_agent: str = DEFAULT_USER_AGENT, cookie: Optional[str] =
     if clock is not None:
         opener.clock = clock
     redirect.owner = opener
+    cookies.owner = opener
     return opener
 
 
@@ -642,12 +849,32 @@ def _content_type(headers) -> str:
     return raw.split(";", 1)[0].strip().lower()
 
 
-def _read_limited(response, limit: int) -> bytes:
-    """Czyta odpowiedź kawałkami, pilnując limitu rozmiaru."""
+def _read_limited(response, limit: int, deadline: Optional[float] = None,
+                  clock: Callable[[], float] = time.monotonic) -> bytes:
+    """Czyta odpowiedź kawałkami, pilnując limitu rozmiaru ORAZ terminu.
+
+    ``deadline`` to bezwzględny moment (w skali ``clock``), po którym odczyt jest
+    przerywany :class:`socket.timeout` — istniejąca gałąź ``except`` w
+    :func:`fetch_full` potraktuje to jak zwykły błąd sieci (ponowienie,
+    a po wyczerpaniu prób :class:`FetchError`).  Bez tego serwer sączący dane po
+    bajcie nigdy nie przekracza timeoutu POJEDYNCZEJ operacji i potrafi trzymać
+    narzędzie dowolnie długo.
+
+    Czytamy przez ``read1`` (jeden odczyt z gniazda), a nie ``read``, bo ``read``
+    blokuje do skompletowania całego żądanego bloku — wtedy sprawdzenie terminu
+    nigdy by nie doszło do głosu.
+    """
+    reader = getattr(response, "read1", None)
+    if not callable(reader):  # atrapy w testach mają tylko read()
+        reader = response.read
     chunks = []
     total = 0
     while True:
-        chunk = response.read(65536)
+        if deadline is not None and clock() > deadline:
+            raise socket.timeout(
+                "przekroczono łączny czas odpowiedzi (odebrano %d bajtów)" % total
+            )
+        chunk = reader(65536)
         if not chunk:
             break
         total += len(chunk)
@@ -657,6 +884,75 @@ def _read_limited(response, limit: int) -> bytes:
             )
         chunks.append(chunk)
     return b"".join(chunks)
+
+
+def _check_complete(headers, data: bytes) -> None:
+    """Porównuje długość odebranej treści z nagłówkiem ``Content-Length``.
+
+    ``http.client.HTTPResponse.read(amt)`` ŚWIADOMIE nie zgłasza
+    :class:`http.client.IncompleteRead`, gdy serwer rozłączy się w połowie ciała
+    (kompatybilność z serwerami łamiącymi protokół).  Bez tego sprawdzenia
+    obcięta odpowiedź trafiała na dysk jako komplet i przy kolejnym uruchomieniu
+    była pomijana jako "już pobrana" — uszkodzenie było TRWAŁE.
+    """
+    try:
+        declared = headers.get("Content-Length", None)
+        chunked = (headers.get("Transfer-Encoding", "") or "").strip().lower()
+    except AttributeError:  # pragma: no cover - nietypowy obiekt nagłówków
+        return
+    if declared is None:
+        return
+    if chunked and chunked != "identity":
+        # przy kodowaniu blokowym Content-Length nie opisuje treści (http.client
+        # go ignoruje), a urwanie strumienia i tak daje IncompleteRead
+        return
+    text = str(declared).strip()
+    if not text.isdigit():
+        return
+    expected = int(text)
+    if len(data) < expected:
+        raise http.client.IncompleteRead(data, expected - len(data))
+
+
+def _decompress(headers, data: bytes, limit: int) -> bytes:
+    """Rozpakowuje ``Content-Encoding: gzip``/``deflate`` (tylko stdlib).
+
+    Prosimy o ``Accept-Encoding: identity``, ale Cloudflare i nginx z
+    ``gzip_static`` i tak potrafią przysłać skompresowaną treść.  Bez tego
+    ``download_xml`` widział bajty ``\\x1f\\x8b``, ogłaszał "to nie XML" i radził
+    ``--cookie`` — diagnoza całkowicie myląca.
+
+    Limit rozmiaru sprawdzamy PONOWNIE po rozpakowaniu (ochrona przed bombą zip).
+    """
+    try:
+        raw = headers.get("Content-Encoding", "") or ""
+    except AttributeError:  # pragma: no cover - nietypowy obiekt nagłówków
+        return data
+    encoding = raw.split(",")[0].strip().lower()
+    if not data or encoding in ("", "identity"):
+        return data
+    try:
+        if encoding in ("gzip", "x-gzip"):
+            data = gzip.decompress(data)
+        elif encoding in ("deflate", "zlib", "x-deflate"):
+            try:
+                data = zlib.decompress(data)
+            except zlib.error:                       # postać "surowa", bez nagłówka
+                data = zlib.decompress(data, -zlib.MAX_WBITS)
+        else:
+            _warn("Nieznane kodowanie treści %r — zostawiam bajty bez zmian" % encoding)
+            return data
+    except (OSError, EOFError, zlib.error) as exc:
+        # uszkodzona/obcięta kompresja = błąd transmisji -> ponowienie w fetch_full
+        raise http.client.HTTPException(
+            "nie udało się rozpakować odpowiedzi (Content-Encoding: %s): %s"
+            % (encoding, exc)
+        ) from exc
+    if limit and len(data) > limit:
+        raise ScrapeError(
+            "Rozpakowana odpowiedź przekracza limit %d bajtów (podnieś max_bytes)" % limit
+        )
+    return data
 
 
 def _retry_after(headers, fallback: float) -> float:
@@ -676,6 +972,14 @@ def _retry_after(headers, fallback: float) -> float:
     return min(MAX_BACKOFF, seconds)
 
 
+def _response_deadline(opener) -> Optional[float]:
+    """Termin, do którego musi się zmieścić CAŁA odpowiedź (albo ``None``)."""
+    timeout = getattr(opener, "timeout", 0) or 0
+    if timeout <= 0:
+        return None
+    return opener.clock() + max(timeout * RESPONSE_TIMEOUT_FACTOR, timeout)
+
+
 def fetch_full(opener, url: str) -> tuple:
     """Jak :func:`fetch`, ale zwraca też nagłówki: ``(dane, content_type, headers)``."""
     url = _normalize_url(url)
@@ -690,11 +994,15 @@ def fetch_full(opener, url: str) -> tuple:
             request = urllib.request.Request(url, headers=opener.headers())
             response = opener.director.open(request, timeout=opener.timeout)
             try:
-                data = _read_limited(response, opener.max_bytes)
+                data = _read_limited(response, opener.max_bytes,
+                                     deadline=_response_deadline(opener),
+                                     clock=opener.clock)
                 ctype = _content_type(response.headers)
                 headers = response.headers
             finally:
                 response.close()
+            _check_complete(headers, data)
+            data = _decompress(headers, data, opener.max_bytes)
             opener.stats["requests"] += 1
             opener.stats["bytes"] += len(data)
             return data, ctype, headers
@@ -717,7 +1025,10 @@ def fetch_full(opener, url: str) -> tuple:
                 url=url, status=status,
             ) from exc
         except (urllib.error.URLError, socket.timeout, TimeoutError,
-                http.client.HTTPException, ConnectionError, OSError) as exc:
+                http.client.HTTPException, ConnectionError, OSError,
+                ValueError) as exc:
+            # ValueError leci m.in. z http.client przy niepoprawnej wartości
+            # nagłówka — nie wolno mu uciec z warstwy scrape surowym tracebackiem
             opener.stats["requests"] += 1
             reason = getattr(exc, "reason", exc)
             last_message = "%s: %s" % (type(exc).__name__, reason)
@@ -888,6 +1199,15 @@ _RAW_URL_RE = re.compile(
     re.IGNORECASE,
 )
 
+#: Ścieżka WZGLĘDNA kończąca się na ``.xml`` (postać typowa dla ``__NEXT_DATA__``
+#: i innych osadzonych JSON-ów: ``{"batchUrl":"batch/11588.xml"}``).  Bez tego
+#: wzorca plik wymieniony wprost w treści strony był niewidoczny, mimo że
+#: SITE_NOTES każe szukać "w całej treści adresów pasujących do \\.xml".
+_RAW_XML_RE = re.compile(
+    r"""["'(]\s*([A-Za-z0-9_][^\s"'()<>]{0,400}\.xml(?:\?[^\s"'()<>]{0,200})?)""",
+    re.IGNORECASE,
+)
+
 
 def _decode_html(data: bytes, content_type: str = "") -> tuple:
     """Dekoduje HTML: BOM -> nagłówek -> ``<meta charset>`` -> UTF-8 (z podmianą)."""
@@ -942,7 +1262,9 @@ def parse_page(data, url: str, content_type: str = "") -> Page:
         candidate = absolutize(url, parser.base_href)
         if candidate:
             base = candidate
-    page = Page(url=url, title=re.sub(r"\s+", " ", parser.title).strip(),
+    # tytuł i teksty linków idą prosto na konsolę użytkownika — najpierw
+    # wycinamy z nich sekwencje sterujące terminala (\x1b[2J, OSC, ...)
+    page = Page(url=url, title=re.sub(r"\s+", " ", strip_controls(parser.title)).strip(),
                 text_len=len(text), scripts=len(parser.scripts), encoding=encoding,
                 forms=len(parser.forms))
     seen = set()
@@ -955,7 +1277,7 @@ def parse_page(data, url: str, content_type: str = "") -> Page:
         absolute = absolutize(base, _unescape_js(href))
         if not absolute:
             continue
-        clean_text = re.sub(r"\s+", " ", anchor_text or "").strip()
+        clean_text = re.sub(r"\s+", " ", strip_controls(anchor_text)).strip()
         key = (absolute, clean_text, tag)
         if key in seen:
             continue
@@ -966,13 +1288,19 @@ def parse_page(data, url: str, content_type: str = "") -> Page:
     haystacks = list(parser.scripts)
     haystacks.append(text)
     for blob in haystacks:
-        for match in _RAW_URL_RE.finditer(_unescape_js(blob)):
-            absolute = absolutize(base, match.group(1))
-            if not absolute or absolute in known:
-                continue
-            known.add(absolute)
-            page.links.append(Link(url=absolute, text="", tag="script",
-                                   attrs={}, source="script"))
+        clean = _unescape_js(blob)
+        # ścieżek WZGLĘDNYCH szukamy wyłącznie w osadzonym JSON/JS: w samym
+        # HTML-u ".xml" siedzi też w atrybutach opisowych (np. download="a.xml"),
+        # które nie są adresami i prowadziłyby na 404
+        patterns = (_RAW_URL_RE,) if blob is text else (_RAW_URL_RE, _RAW_XML_RE)
+        for regex in patterns:
+            for match in regex.finditer(clean):
+                absolute = absolutize(base, match.group(1))
+                if not absolute or absolute in known:
+                    continue
+                known.add(absolute)
+                page.links.append(Link(url=absolute, text="", tag="script",
+                                       attrs={}, source="script"))
     return page
 
 
@@ -988,7 +1316,7 @@ def describe_page(data, url: str = "", *, content_type: str = "", stream=None,
     Zwraca raport (tekst) i — gdy podano ``stream`` — wypisuje go tam.
     Nigdy nie rzuca wyjątkiem, nawet dla śmieci zamiast HTML-a.
     """
-    lines = ["--- diagnostyka strony: %s ---" % (url or "(bez adresu)")]
+    lines = ["--- diagnostyka strony: %s ---" % (strip_controls(url) or "(bez adresu)")]
     try:
         page = parse_page(data, url or "http://example.invalid/", content_type)
     except Exception as exc:  # pragma: no cover - parse_page łapie swoje błędy
@@ -1029,7 +1357,8 @@ def describe_page(data, url: str = "", *, content_type: str = "", stream=None,
         for link in other[:limit]:
             lines.append("  %s" % link.url)
     lines.append("--- koniec diagnostyki ---")
-    report = "\n".join(lines)
+    # ostatnia siatka bezpieczeństwa: raport w całości pochodzi z obcej strony
+    report = strip_controls("\n".join(lines))
     if stream is not None:
         print(report, file=stream)
     return report
@@ -1136,11 +1465,11 @@ def discover_auctions(opener, base_url: str, *, auction_re: Optional[str] = None
             match = pattern.search(path)
             if not match:
                 continue
-            ident = _auction_id(match, link.url)
+            ident = strip_controls(_auction_id(match, link.url))
             if not ident:
                 continue
             title = link.text or link.attrs.get("title") or link.attrs.get("aria-label") or ""
-            title = re.sub(r"\s+", " ", title).strip() or ident
+            title = re.sub(r"\s+", " ", strip_controls(title)).strip() or ident
             existing = found.get(ident)
             if existing is None:
                 found[ident] = AuctionRef(url=link.url, id=ident, title=title)
@@ -1214,16 +1543,46 @@ def _has_boring_ext(url: str) -> bool:
     return path.endswith(_BORING_EXT)
 
 
+#: Znaczniki kolejności bajtów (od najdłuższego — ``\xff\xfe\x00\x00`` zaczyna
+#: się tak samo jak BOM UTF-16LE, więc kolejność ma znaczenie).
+_BOMS = (
+    (b"\x00\x00\xfe\xff", "utf-32-be"),
+    (b"\xff\xfe\x00\x00", "utf-32-le"),
+    (b"\xef\xbb\xbf", "utf-8"),
+    (b"\xff\xfe", "utf-16-le"),
+    (b"\xfe\xff", "utf-16-be"),
+)
+
+#: Początki treści, które są stroną HTML, a nie plikiem XML.
+_HTML_STARTS = ("<!doctype html", "<html")
+
+
+def _xml_head_verdict(head: str) -> bool:
+    """Czy tak zaczynający się (już zdekodowany) dokument to XML, a nie HTML?"""
+    head = head.lstrip("﻿").lstrip().lower()
+    if not head.startswith("<"):
+        return False
+    return not head.startswith(_HTML_STARTS)
+
+
 def _looks_like_xml(data: bytes) -> bool:
-    """Czy początek treści wygląda na XML (a nie na HTML)?"""
+    """Czy początek treści wygląda na XML (a nie na HTML)?
+
+    Rozpoznajemy także kodowania szerokie: BOM UTF-16/UTF-32 oraz UTF-16 bez BOM
+    (sekwencja ``<\\x00`` / ``\\x00<``).  Eksporty z narzędzi windowsowych bardzo
+    często są w UTF-16LE, a kontrakt ``xmlflatten`` wprost wymaga obsługi BOM-ów
+    i kodowań innych niż UTF-8 — scraper nie może takiego pliku zgubić.
+    """
     if not data:
         return False
-    head = data.lstrip(b"\xef\xbb\xbf").lstrip()[:512].lower()
-    if not head.startswith(b"<"):
-        return False
-    if head.startswith(b"<!doctype html") or head.startswith(b"<html"):
-        return False
-    return True
+    for bom, encoding in _BOMS:
+        if data.startswith(bom):
+            return _xml_head_verdict(data[len(bom):1024].decode(encoding, "replace"))
+    stripped = data.lstrip()
+    if stripped[:2] in (b"<\x00", b"\x00<"):
+        encoding = "utf-16-le" if stripped[:2] == b"<\x00" else "utf-16-be"
+        return _xml_head_verdict(stripped[:1024].decode(encoding, "replace"))
+    return _xml_head_verdict(stripped[:512].decode("latin-1", "replace"))
 
 
 @dataclass
@@ -1266,8 +1625,43 @@ def _xml_candidates(page: Page, opener) -> list:
     return candidates
 
 
+def _remember_probe(opener, url: str, data: bytes, ctype: str) -> None:
+    """Zapamiętuje treść pobraną w sondzie, żeby nie ściągać jej drugi raz.
+
+    Budżet :data:`PROBE_CACHE_MAX_BYTES` obejmuje ŁĄCZNIE wszystkie zapamiętane
+    treści — po jego przekroczeniu kolejne pliki po prostu pobierzemy drugi raz
+    (transfer jest tańszy niż niekontrolowany wzrost pamięci).
+    """
+    bodies = getattr(opener, "_probe_bodies", None)
+    if bodies is None or len(data) > PROBE_CACHE_MAX_BYTES:
+        return
+    used = sum(len(body) for body, _ctype in bodies.values())
+    if used + len(data) > PROBE_CACHE_MAX_BYTES:
+        return
+    bodies[url] = (data, ctype)
+
+
+def take_probed_body(opener, url: str):
+    """Wyjmuje (i usuwa) treść zapamiętaną w sondzie — albo ``None``.
+
+    Sonda ``Content-Type`` ściąga cały plik; bez tego cache'u ``download_xml``
+    pobierałby dokładnie ten sam adres PONOWNIE, podwajając transfer i liczbę
+    uprzejmych opóźnień dla każdego przycisku "Download Batch Details".
+    """
+    bodies = getattr(opener, "_probe_bodies", None)
+    if not bodies:
+        return None
+    return bodies.pop(url, None)
+
+
 def _confirm_by_content_type(opener, url: str, fetch_fn) -> bool:
-    """Sonduje adres i mówi, czy to XML (wynik zapamiętany w openerze)."""
+    """Sonduje adres i mówi, czy to XML (wynik zapamiętany w openerze).
+
+    Treść jest już w pamięci, więc oglądamy ją NIEZALEŻNIE od zadeklarowanego
+    typu MIME: endpointy eksportu bardzo często zwracają XML z nagłówkiem
+    ``text/html``, a :func:`_looks_like_xml` i tak odróżnia XML od strony HTML
+    (odrzuca ``<!doctype html`` i ``<html``).
+    """
     cache = getattr(opener, "_ctype_cache", None)
     if cache is not None and url in cache:
         return cache[url]
@@ -1278,8 +1672,10 @@ def _confirm_by_content_type(opener, url: str, fetch_fn) -> bool:
         ctype = (ctype or "").split(";", 1)[0].strip().lower()
         if ctype in XML_CONTENT_TYPES or ctype.endswith("+xml"):
             verdict = True
-        elif ctype in AMBIGUOUS_CONTENT_TYPES and _looks_like_xml(data):
-            verdict = True
+        else:
+            verdict = _looks_like_xml(data)
+        if verdict:
+            _remember_probe(opener, url, data, ctype)
     except ScrapeError as exc:
         _warn("Nie udało się sprawdzić %s (%s)" % (url, exc))
         verdict = False
@@ -1379,9 +1775,21 @@ def find_xml_links(opener, auction: AuctionRef, *, opener_fetch=None,
     direct = collect(page)
 
     mode = (descend or "auto").lower()
-    should_descend = mode == "always" or (mode == "auto" and direct == 0)
+    # "auto" schodzi do lotów ZAWSZE, gdy strona aukcji ma strony lotów.
+    # Dawniej wystarczył jeden XML na stronie aukcji (np. zbiorczy "Download
+    # Batch Details (whole auction)"), żeby pominąć WSZYSTKIE loty — a
+    # SITE_NOTES.md wprost ostrzega, że pakiety wiszą poziom niżej.  Użytkownik
+    # dostawał niekompletny arkusz i nie miał jak się o tym dowiedzieć.
+    # Powtórzenia i tak odsiewa deduplikacja (po hashu lotu i po adresie XML-a).
+    lots = [] if mode == "never" else _lot_urls(page, auction, opener)
+    should_descend = mode == "always" or (mode == "auto" and bool(lots))
     if should_descend and mode != "never":
-        lots = _lot_urls(page, auction, opener)
+        if direct and mode == "auto":
+            _warn(
+                "Aukcja %s ma XML na swojej stronie (%d) i dodatkowo %d stron lotów "
+                "— schodzę też do lotów (--descend never wyłącza to zejście)."
+                % (auction.id, direct, len(lots))
+            )
         if len(lots) > max_lots:
             _warn("Aukcja %s ma %d lotów — ograniczam do %d (max_lots)"
                   % (auction.id, len(lots), max_lots))
@@ -1440,12 +1848,16 @@ def download_xml(opener, ref: XmlRef, out_dir, *, overwrite: bool = False,
         raise ScrapeError("Nazwa pliku wyprowadza poza katalog docelowy: %r" % ref.filename)
     if os.path.exists(path) and not overwrite:
         return path
-    data, ctype = (fetch_fn or fetch)(opener, ref.url)
+    cached = take_probed_body(opener, ref.url)
+    if cached is not None:
+        data, ctype = cached           # treść z sondy Content-Type — bez drugiego GET
+    else:
+        data, ctype = (fetch_fn or fetch)(opener, ref.url)
     if verify_xml:
         if not data.strip():
             raise NotXmlError("Pusta odpowiedź dla %s" % ref.url)
         if not _looks_like_xml(data):
-            head = data.lstrip()[:200].decode("utf-8", "replace")
+            head = strip_controls(data.lstrip()[:200].decode("utf-8", "replace"))
             raise NotXmlError(
                 "Treść spod %s nie jest XML-em (Content-Type: %s). "
                 "Portal mógł zwrócić stronę logowania — spróbuj z opcją --cookie.\n"

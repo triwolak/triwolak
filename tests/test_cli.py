@@ -25,6 +25,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 
 TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT_DIR = os.path.dirname(TESTS_DIR)
@@ -32,7 +33,7 @@ for _path in (ROOT_DIR, TESTS_DIR):
     if _path not in sys.path:
         sys.path.insert(0, _path)
 
-from flexit2xlsx import cli, xmlflatten  # noqa: E402
+from flexit2xlsx import cli, values, xmlflatten  # noqa: E402
 from flexit2xlsx import xlsxwrite  # noqa: E402
 
 try:
@@ -437,9 +438,12 @@ class TestBuildOptions(CliTestCase):
         self.addCleanup(workbook.close)
         self.assertEqual(workbook.sheetnames[:2], [cli.SHEET_ALL, cli.SHEET_SUMMARY])
         self.assertEqual(len(workbook.sheetnames), 2 + 5)
+        # zakładki są numerowane w kolejności z arkusza Podsumowanie, a sama
+        # nazwa aukcji zostaje rozpoznawalna (patrz _auction_sheet_name)
         for name in ("AUK-2026-01", "BATCH-77", "plaski", "FV-9", "RAP-5"):
-            self.assertIn(name, workbook.sheetnames)
-        worksheet = workbook["AUK-2026-01"]
+            self.assertTrue(any(tab.endswith(" " + name) for tab in workbook.sheetnames),
+                            "brak zakładki dla %s w %s" % (name, workbook.sheetnames))
+        worksheet = workbook["01 AUK-2026-01"]
         rows = [tuple(r) for r in worksheet.iter_rows(values_only=True)]
         self.assertEqual(list(rows[0][:2]), cli.TECH_COLUMNS_PER_AUCTION)
         self.assertEqual(len(rows), 1 + 3)
@@ -804,12 +808,15 @@ class TestDownloadAgainstMockSite(CliTestCase):
         result = call_cli(["download", "--out", self.xml_dir] + self.base_args())
         self.assertEqual(result.code, cli.EXIT_OK, result.err)
         files = sorted(os.listdir(self.xml_dir))
-        self.assertEqual(len(files), 6, files)
+        # 7, bo aukcja 1103 ma zbiorczy XML ORAZ pakiet lotu bcd12 —
+        # "--descend auto" schodzi teraz do lotów także wtedy, gdy strona
+        # aukcji sama coś dała
+        self.assertEqual(len(files), 7, files)
         for name in files:
             self.assertTrue(name.endswith(".xml"), name)
             with open(os.path.join(self.xml_dir, name), "rb") as handle:
                 self.assertTrue(handle.read().lstrip().startswith(b"<?xml"))
-        self.assertIn("Pobrano 6 plików", result.out)
+        self.assertIn("Pobrano 7 plików", result.out)
 
     def test_second_run_skips_existing_files(self):
         call_cli(["download", "--out", self.xml_dir] + self.base_args("--quiet"))
@@ -817,7 +824,7 @@ class TestDownloadAgainstMockSite(CliTestCase):
         result = call_cli(["download", "--out", self.xml_dir] + self.base_args())
         self.assertEqual(result.code, cli.EXIT_OK, result.err)
         self.assertEqual(sorted(os.listdir(self.xml_dir)), before)
-        self.assertIn("pominięto 6 plików", result.out)
+        self.assertIn("pominięto 7 plików", result.out)
 
     def test_dry_run_downloads_nothing(self):
         result = call_cli(["download", "--out", self.xml_dir, "--dry-run"] + self.base_args())
@@ -888,15 +895,15 @@ class TestDownloadAgainstMockSite(CliTestCase):
         result = call_cli(["all", "--in", self.xml_dir, "--out", self.out]
                           + self.base_args())
         self.assertEqual(result.code, cli.EXIT_OK, result.err)
-        self.assertEqual(len(os.listdir(self.xml_dir)), 6)
+        self.assertEqual(len(os.listdir(self.xml_dir)), 7)
         self.assertTrue(os.path.isfile(self.out))
         rows = as_dicts(sheet_rows(self.out, cli.SHEET_ALL))
-        # 6 pobranych pakietów: 3 + 2 + 2 + 1 + 1 + 1 sztuk sprzętu
-        self.assertEqual(len(rows), 10)
+        # 7 pobranych pakietów: 3 + 2 + 2 + 1 + 1 + 1 + 1 sztuk sprzętu
+        self.assertEqual(len(rows), 11)
         self.assertEqual(len({row["Aukcja"] for row in rows}), 2)
         # kolumny zunifikowane mimo różnej liczby pozycji w pakietach:
         # KAŻDY wiersz ma wypełnioną tę samą kolumnę "model"
-        self.assertEqual(sum(1 for row in rows if row["model"]), 10)
+        self.assertEqual(sum(1 for row in rows if row["model"]), 11)
         # nazwy plików są bezpieczne — path traversal z portalu nie przechodzi
         for name in os.listdir(self.xml_dir):
             self.assertNotIn("..", name)
@@ -951,6 +958,445 @@ class TestContract(unittest.TestCase):
         self.assertEqual(sheets[0].name, cli.SHEET_ALL)
         self.assertFalse(isinstance(sheets[0].rows, list))
         self.assertEqual(len(list(sheets[0].rows)), 4)
+
+
+# ---------------------------------------------------------------------------
+# 12. REGRESJE po audycie adwersaryjnym
+# ---------------------------------------------------------------------------
+
+
+def _batch_xml(auction: str, items: int, first: int = 0) -> str:
+    """Realistyczny "Batch Details": aukcja -> lot -> pozycje."""
+    body = "".join(
+        "<item nr='%d'><model>ThinkPad T%d</model><serial>SN%06d</serial>"
+        "<grade>A</grade><ram>16 GB</ram></item>" % (i, 480 + i % 3, first + i)
+        for i in range(items)
+    )
+    return ("<?xml version='1.0' encoding='UTF-8'?>"
+            "<batch auction='%s'><lot><title>Pakiet</title><items>%s</items>"
+            "</lot></batch>" % (auction, body))
+
+
+class TestPamieciPotoku(CliTestCase):
+    """REGRESJA: potok ma być strumieniowy — pamięć O(największy plik)."""
+
+    def _corpus(self, files, items):
+        for index in range(files):
+            path = os.path.join(self.xml_dir, "b%03d.xml" % index)
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(_batch_xml("auk-%03d" % index, items, index * 1000))
+
+    def test_dokumenty_sa_zwalniane_po_przekroczeniu_budzetu(self):
+        """Powyżej ``MEMORY_ROW_BUDGET`` rekordy nie zostają w pamięci.
+
+        Dawniej ``load_documents`` trzymało wszystkie ``ParsedDoc`` aż do końca
+        zapisu, więc szczyt pamięci rósł LINIOWO z rozmiarem całego korpusu
+        (~715 B na wiersz; milion wierszy = ponad 800 MB), mimo że
+        ``xlsxwrite`` zapisuje strumieniowo.
+        """
+        self._corpus(files=10, items=10)          # 100 wierszy razem
+        files = cli.collect_xml_files([self.xml_dir])
+        saved = cli.MEMORY_ROW_BUDGET
+        try:
+            cli.MEMORY_ROW_BUDGET = 25            # budżet mniejszy niż korpus
+            docs, errors = cli.load_documents(files)
+        finally:
+            cli.MEMORY_ROW_BUDGET = saved
+        self.assertEqual(errors, [])
+        self.assertEqual(len(docs), 10)
+        self.assertFalse(any(doc.cached for doc in docs),
+                         "po przekroczeniu budżetu żaden dokument nie zostaje w RAM")
+        # ...a mimo to metadane i wiersze są kompletne
+        self.assertEqual(sum(doc.count for doc in docs), 100)
+        columns = xmlflatten.merge_columns(docs)
+        rows = list(cli._iter_rows(docs, columns, with_auction=True, use_typing=True))
+        self.assertEqual(len(rows), 100)
+        self.assertEqual(len({row[0] for row in rows}), 10)
+
+    def test_male_korpusy_zostaja_w_pamieci(self):
+        """Poniżej budżetu nie ma ponownego parsowania (szybciej)."""
+        self._corpus(files=3, items=5)
+        docs, _ = cli.load_documents(cli.collect_xml_files([self.xml_dir]))
+        self.assertTrue(all(doc.cached for doc in docs))
+
+    def test_wynik_jest_taki_sam_w_obu_trybach(self):
+        """Tryb strumieniowy nie może zmienić ANI JEDNEGO wiersza."""
+        self._corpus(files=6, items=7)
+        args = ["build", "--in", self.xml_dir, "--quiet", "--overwrite"]
+        out_a = os.path.join(self.tmp, "a.xlsx")
+        out_b = os.path.join(self.tmp, "b.xlsx")
+        saved = cli.MEMORY_ROW_BUDGET
+        try:
+            cli.MEMORY_ROW_BUDGET = 10 ** 9
+            self.assertEqual(call_cli(args + ["--out", out_a]).code, cli.EXIT_OK)
+            cli.MEMORY_ROW_BUDGET = 1
+            self.assertEqual(call_cli(args + ["--out", out_b]).code, cli.EXIT_OK)
+        finally:
+            cli.MEMORY_ROW_BUDGET = saved
+        if openpyxl is None:
+            self.skipTest("openpyxl potrzebny do porównania wyników")
+        self.assertEqual(sheet_rows(out_a, cli.SHEET_ALL),
+                         sheet_rows(out_b, cli.SHEET_ALL))
+        self.assertEqual(sheet_rows(out_a, cli.SHEET_SUMMARY),
+                         sheet_rows(out_b, cli.SHEET_SUMMARY))
+
+    def test_znikniety_plik_nie_wywraca_zapisu(self):
+        """Gdy plik zniknie po wczytaniu metadanych, tracimy JEGO wiersze, nie całość."""
+        self._corpus(files=3, items=4)
+        files = cli.collect_xml_files([self.xml_dir])
+        saved = cli.MEMORY_ROW_BUDGET
+        try:
+            cli.MEMORY_ROW_BUDGET = 1
+            docs, _ = cli.load_documents(files)
+        finally:
+            cli.MEMORY_ROW_BUDGET = saved
+        os.remove(docs[1].source)
+        reporter = cli.Reporter(quiet=True, err=io.StringIO())
+        columns = xmlflatten.merge_columns(docs)
+        rows = list(cli._iter_rows(docs, columns, with_auction=True,
+                                   use_typing=True, reporter=reporter))
+        self.assertEqual(len(rows), 8)
+        self.assertIn("Nie udało się ponownie wczytać", reporter.err.getvalue())
+
+
+class TestBrakuPamieci(CliTestCase):
+    """REGRESJA: ``MemoryError`` ma dawać komunikat po polsku, nie traceback."""
+
+    def test_plik_ktory_nie_miesci_sie_w_pamieci_jest_pomijany(self):
+        write_fixtures(self.xml_dir)
+        zly = os.path.join(self.xml_dir, "za-duzy.xml")
+        with open(zly, "w", encoding="utf-8") as handle:
+            handle.write(XML_PLASKI)
+
+        prawdziwy = xmlflatten.parse_file
+
+        def czasem_brak_pamieci(path, **kw):
+            if os.path.basename(path) == "za-duzy.xml":
+                raise MemoryError()
+            return prawdziwy(path, **kw)
+
+        with unittest.mock.patch.object(xmlflatten, "parse_file", czasem_brak_pamieci):
+            result = call_cli(["build", "--in", self.xml_dir, "--out", self.out])
+        self.assertEqual(result.code, cli.EXIT_PARTIAL)
+        self.assertIn("za mało pamięci", result.err)
+        self.assertNotIn("Traceback", result.err)
+        self.assertTrue(os.path.isfile(self.out), "reszta plików mimo wszystko trafia do wyniku")
+
+    def test_main_lapie_memoryerror_z_dowolnego_miejsca(self):
+        def wybuchowe(*args, **kw):
+            raise MemoryError()
+
+        with unittest.mock.patch.object(cli, "cmd_build", wybuchowe):
+            result = call_cli(["build", "--in", self.xml_dir, "--out", self.out])
+        self.assertEqual(result.code, cli.EXIT_ERROR)
+        self.assertIn("Za mało pamięci", result.err)
+        self.assertNotIn("Traceback", result.err)
+
+    def test_main_nie_wypuszcza_zadnego_wyjatku(self):
+        """Ostatnia siatka bezpieczeństwa: żaden błąd nie wychodzi tracebackiem."""
+        def wybuchowe(*args, **kw):
+            raise RuntimeError("coś się urwało w środku")
+
+        with unittest.mock.patch.object(cli, "cmd_build", wybuchowe):
+            result = call_cli(["build", "--in", self.xml_dir, "--out", self.out])
+        self.assertEqual(result.code, cli.EXIT_ERROR)
+        self.assertIn("Nieoczekiwany błąd", result.err)
+        self.assertIn("coś się urwało w środku", result.err)
+
+
+class TestKosztuUjednolicania(CliTestCase):
+    """REGRESJA: ``unify_record_paths`` nie może mieć kosztu kwadratowego."""
+
+    def test_liczba_parsowan_nie_jest_iloczynem(self):
+        """Dawniej: N plików bez powtórzeń x M ścieżek = N*M parsowań.
+
+        Pliki bez powtarzalnego elementu nie zawierają ŻADNEGO ze znaczników
+        kandydatów, więc po przedfiltrze nie ma czego parsować.
+        """
+        for index in range(20):
+            tag = "poz%03d" % index
+            body = "".join("<%s><m>M%d</m></%s>" % (tag, j, tag) for j in range(3))
+            with open(os.path.join(self.xml_dir, "wiele%03d.xml" % index), "w",
+                      encoding="utf-8") as handle:
+                handle.write("<?xml version='1.0'?><r%03d><items>%s</items></r%03d>"
+                             % (index, body, index))
+        for index in range(20):
+            with open(os.path.join(self.xml_dir, "jeden%03d.xml" % index), "w",
+                      encoding="utf-8") as handle:
+                handle.write("<?xml version='1.0'?><rX><items>"
+                             "<inny><m>M</m></inny></items></rX>")
+
+        docs, _ = cli.load_documents(cli.collect_xml_files([self.xml_dir]))
+        licznik = {"n": 0}
+        prawdziwy = xmlflatten.parse_bytes
+
+        def counted(*args, **kw):
+            licznik["n"] += 1
+            return prawdziwy(*args, **kw)
+
+        with unittest.mock.patch.object(xmlflatten, "parse_bytes", counted):
+            cli.unify_record_paths(docs)
+        self.assertEqual(licznik["n"], 0, "przedfiltr odsiał wszystkich kandydatów")
+
+    def test_najwyzej_kilka_prob_na_plik(self):
+        """Gdy znacznik JEST w pliku, próbujemy najwyżej kilku ścieżek."""
+        for index in range(5):
+            body = "".join("<item><m>M%d</m></item>" % j for j in range(3))
+            with open(os.path.join(self.xml_dir, "wiele%03d.xml" % index), "w",
+                      encoding="utf-8") as handle:
+                handle.write("<?xml version='1.0'?><r%03d><items>%s</items></r%03d>"
+                             % (index, body, index))
+        # plik jednopozycyjny z tym samym znacznikiem, ale w innym miejscu drzewa
+        with open(os.path.join(self.xml_dir, "jeden.xml"), "w", encoding="utf-8") as handle:
+            handle.write("<?xml version='1.0'?><inny><gdzies><item><m>M</m></item>"
+                         "</gdzies></inny>")
+        docs, _ = cli.load_documents(cli.collect_xml_files([self.xml_dir]))
+        licznik = {"n": 0}
+        prawdziwy = xmlflatten.parse_bytes
+
+        def counted(*args, **kw):
+            licznik["n"] += 1
+            return prawdziwy(*args, **kw)
+
+        with unittest.mock.patch.object(xmlflatten, "parse_bytes", counted):
+            cli.unify_record_paths(docs)
+        self.assertLessEqual(licznik["n"], cli.UNIFY_MAX_CANDIDATES)
+
+    def test_ujednolicanie_dalej_dziala(self):
+        """Sedno funkcji: plik z JEDNĄ pozycją dostaje kolumny jak reszta."""
+        with open(os.path.join(self.xml_dir, "wiele.xml"), "w", encoding="utf-8") as handle:
+            handle.write(_batch_xml("auk-1", 3))
+        with open(os.path.join(self.xml_dir, "jeden.xml"), "w", encoding="utf-8") as handle:
+            handle.write(_batch_xml("auk-2", 1))
+        docs, _ = cli.load_documents(cli.collect_xml_files([self.xml_dir]))
+        unified = cli.unify_record_paths(docs)
+        self.assertEqual({os.path.basename(p) for p in unified}, {"jeden.xml"})
+        self.assertEqual(len({doc.record_path for doc in docs}), 1)
+        for doc in docs:
+            self.assertIn("model", doc.columns)
+
+
+class TestPamieciRozpoznawaniaTypow(CliTestCase):
+    """REGRESJA: bufor wyników ``coerce_value`` nie może zmieniać wyników."""
+
+    def test_bufor_daje_te_same_wartosci_co_bez_bufora(self):
+        probki = ["1 234,56", "1234.56", "007", "true", "FALSE", "2026-06-18",
+                  "18.06.2026", "16 GB", "1.2.3", "", "   ", "PF1A2B3C",
+                  "-12", "+3.5", "e0c8f", "192.168.0.1", "1,5", "  7  "]
+        cache = {}
+        for raw in probki * 3:
+            with self.subTest(raw=raw):
+                self.assertEqual(cli._convert(raw, True, cache),
+                                 values.coerce_value(raw))
+        self.assertLessEqual(len(cache), len(set(probki)))
+
+    def test_bufor_nie_rosnie_ponad_limit(self):
+        cache = {}
+        saved = cli.TYPE_CACHE_MAX
+        try:
+            cli.TYPE_CACHE_MAX = 5
+            for index in range(50):
+                cli._convert("wartosc-%d" % index, True, cache)
+        finally:
+            cli.TYPE_CACHE_MAX = saved
+        self.assertEqual(len(cache), 5)
+
+    def test_dlugie_napisy_nie_trafiaja_do_bufora(self):
+        cache = {}
+        dlugi = "x" * (cli.TYPE_CACHE_MAX_LEN + 1)
+        self.assertEqual(cli._convert(dlugi, True, cache), values.coerce_value(dlugi))
+        self.assertEqual(cache, {})
+
+    def test_wylaczone_typowanie_zwraca_oryginal(self):
+        self.assertEqual(cli._convert("1 234,56", False, {}), "1 234,56")
+
+
+class TestPodzialuNaBlokiKolumn(CliTestCase):
+    """REGRESJA: arkusz-kontynuacja też musi mieć kolumny techniczne."""
+
+    def test_sheet_prosi_o_powtorzenie_kolumn_technicznych(self):
+        doc = xmlflatten.parse_bytes(XML_PLASKI.encode("utf-8"), "x.xml")
+        sheets = cli.build_sheets([doc], per_auction=True)
+        self.assertEqual(getattr(sheets[0], "key_columns", None), len(cli.TECH_COLUMNS))
+        self.assertEqual(getattr(sheets[-1], "key_columns", None),
+                         len(cli.TECH_COLUMNS_PER_AUCTION))
+
+    @unittest.skipIf(openpyxl is None, "openpyxl potrzebny do odczytu wyniku")
+    def test_kolumny_techniczne_powtorzone_w_arkuszu_kontynuacji(self):
+        """Bez tego wiersza z drugiego arkusza nie da się przypisać do aukcji."""
+        saved = xlsxwrite.MAX_COLS_PER_SHEET
+        try:
+            xlsxwrite.MAX_COLS_PER_SHEET = 40
+            pola = "".join("<p%03d>v%03d</p%03d>" % (i, i, i) for i in range(60))
+            with open(os.path.join(self.xml_dir, "szeroki.xml"), "w",
+                      encoding="utf-8") as handle:
+                handle.write("<?xml version='1.0'?><batch><items>"
+                             "<item>%s</item><item>%s</item></items></batch>"
+                             % (pola, pola))
+            result = call_cli(["build", "--in", self.xml_dir, "--out", self.out,
+                               "--overwrite", "--quiet"])
+        finally:
+            xlsxwrite.MAX_COLS_PER_SHEET = saved
+        self.assertEqual(result.code, cli.EXIT_OK, result.err)
+        workbook = openpyxl.load_workbook(self.out)
+        self.addCleanup(workbook.close)
+        dalsze = [name for name in workbook.sheetnames if name.startswith(cli.SHEET_ALL)]
+        self.assertGreater(len(dalsze), 1, workbook.sheetnames)
+        for name in dalsze:
+            header = [cell.value for cell in next(workbook[name].iter_rows(max_row=1))]
+            self.assertEqual(header[:len(cli.TECH_COLUMNS)], cli.TECH_COLUMNS,
+                             "arkusz %s bez kolumn technicznych" % name)
+
+
+class TestNazwZakladekAukcji(CliTestCase):
+    """REGRESJA: zakładka ma pozwolić rozpoznać aukcję."""
+
+    def test_dlugi_identyfikator_zachowuje_koncowke(self):
+        used = set()
+        name = cli._auction_sheet_name("flexit-auctions-18-06-2026-numer-0007", 7, used)
+        self.assertLessEqual(len(name), xlsxwrite.SHEET_NAME_MAX)
+        self.assertTrue(name.startswith("07 "), name)
+        self.assertTrue(name.endswith("numer-0007"), name)
+
+    @unittest.skipIf(openpyxl is None, "openpyxl potrzebny do odczytu wyniku")
+    def test_wiele_aukcji_o_podobnych_nazwach_da_sie_rozroznic(self):
+        for index in range(12):
+            auction = "flexit-auctions-18-06-2026-numer-%04d" % index
+            with open(os.path.join(self.xml_dir, "b%02d.xml" % index), "w",
+                      encoding="utf-8") as handle:
+                handle.write(_batch_xml(auction, 2, index * 10))
+        result = call_cli(["build", "--in", self.xml_dir, "--out", self.out,
+                           "--per-auction", "--overwrite", "--quiet"])
+        self.assertEqual(result.code, cli.EXIT_OK, result.err)
+        workbook = openpyxl.load_workbook(self.out)
+        self.addCleanup(workbook.close)
+        zakladki = workbook.sheetnames[2:]
+        self.assertEqual(len(zakladki), 12)
+        for index, name in enumerate(zakladki):
+            self.assertTrue(name.endswith("numer-%04d" % index),
+                            "zakładka %r nie identyfikuje aukcji" % name)
+
+
+class TestKolejnosciWAll(CliTestCase):
+    """REGRESJA: ``all`` sprawdza plik wynikowy PRZED pobieraniem."""
+
+    @unittest.skipIf(MockSite is None, "brak atrapy portalu")
+    def test_istniejacy_plik_wynikowy_zatrzymuje_pobieranie(self):
+        site = MockSite()
+        self.addCleanup(site.stop)
+        site.state.reset()
+        with open(self.out, "w", encoding="utf-8") as handle:
+            handle.write("stary wynik")
+        result = call_cli(["all", "--in", self.xml_dir, "--out", self.out,
+                           "--base-url", site.base, "--delay", "0"])
+        self.assertEqual(result.code, cli.EXIT_ERROR)
+        self.assertIn("już istnieje", result.err)
+        self.assertIn("Nie zaczynam pobierania", result.err)
+        self.assertEqual(site.state.log, [], "ani jednego żądania do portalu")
+        self.assertEqual(os.listdir(self.xml_dir), [])
+
+    @unittest.skipIf(MockSite is None, "brak atrapy portalu")
+    def test_z_overwrite_all_dziala_normalnie(self):
+        site = MockSite()
+        self.addCleanup(site.stop)
+        site.state.reset()
+        with open(self.out, "w", encoding="utf-8") as handle:
+            handle.write("stary wynik")
+        result = call_cli(["all", "--in", self.xml_dir, "--out", self.out,
+                           "--base-url", site.base, "--delay", "0",
+                           "--overwrite", "--quiet"])
+        self.assertIn(result.code, (cli.EXIT_OK, cli.EXIT_PARTIAL), result.err)
+        self.assertGreater(len(os.listdir(self.xml_dir)), 0)
+
+
+class TestZapisanejStronyLogowania(CliTestCase):
+    """REGRESJA: ``build`` ma rozpoznać zapisaną stronę HTML."""
+
+    def test_html_zamiast_xml_podpowiada_cookie(self):
+        with open(os.path.join(self.xml_dir, "pakiet.xml"), "w", encoding="utf-8") as handle:
+            handle.write("<!DOCTYPE html>\n<html><head><title>Zaloguj się</title></head>"
+                         "<body><form><input name='login'></form></body></html>")
+        with open(os.path.join(self.xml_dir, "dobry.xml"), "w", encoding="utf-8") as handle:
+            handle.write(_batch_xml("auk-1", 2))
+        result = call_cli(["build", "--in", self.xml_dir, "--out", self.out])
+        self.assertEqual(result.code, cli.EXIT_PARTIAL)
+        self.assertIn("strona HTML", result.err)
+        self.assertIn("logowania", result.err)
+        self.assertIn("--cookie", result.err)
+        self.assertNotIn("mismatched tag", result.err)
+
+    def test_zwykly_uszkodzony_xml_dostaje_komunikat_techniczny(self):
+        """Nie każdy błąd to strona logowania — nie zgadujemy na siłę."""
+        with open(os.path.join(self.xml_dir, "zly.xml"), "w", encoding="utf-8") as handle:
+            handle.write("<?xml version='1.0'?><a><b></a>")
+        with open(os.path.join(self.xml_dir, "dobry.xml"), "w", encoding="utf-8") as handle:
+            handle.write(_batch_xml("auk-1", 2))
+        result = call_cli(["build", "--in", self.xml_dir, "--out", self.out])
+        self.assertEqual(result.code, cli.EXIT_PARTIAL)
+        self.assertNotIn("strona logowania", result.err)
+
+
+class TestZlegoCiasteczkaWCli(CliTestCase):
+    """REGRESJA: ``--cookie`` ze znakiem końca linii nie wywala CLI."""
+
+    def test_cookie_z_enterem_w_srodku_daje_komunikat_po_polsku(self):
+        result = call_cli(["download", "--out", self.xml_dir,
+                           "--base-url", "http://127.0.0.1:1/",
+                           "--cookie", "SESSIONID=abc\nX-Zle: 1",
+                           "--delay", "0", "--retries", "0"])
+        self.assertEqual(result.code, cli.EXIT_ERROR)
+        self.assertIn("końca linii", result.err)
+        self.assertNotIn("Traceback", result.err)
+
+    def test_user_agent_z_wstrzyknieciem_jest_odrzucany(self):
+        result = call_cli(["download", "--out", self.xml_dir,
+                           "--base-url", "http://127.0.0.1:1/",
+                           "--user-agent", "UA\r\nX-Wstrzykniete: 1",
+                           "--delay", "0", "--retries", "0"])
+        self.assertEqual(result.code, cli.EXIT_ERROR)
+        self.assertIn("końca linii", result.err)
+
+
+class TestPomocyPoPolsku(unittest.TestCase):
+    """REGRESJA: komunikaty argparse też mają być po polsku."""
+
+    def test_naglowki_sekcji_pomocy(self):
+        text = cli.build_parser().format_help()
+        self.assertIn("argumenty pozycyjne", text)
+        self.assertIn("opcje", text)
+        self.assertNotIn("positional arguments", text)
+        self.assertNotIn("show this help message and exit", text)
+
+    def test_nieznana_podkomenda(self):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            with self.assertRaises(SystemExit) as ctx:
+                cli.build_parser().parse_args(["zbuduj"])
+        self.assertEqual(ctx.exception.code, cli.EXIT_USAGE)
+        message = err.getvalue()
+        self.assertIn("nieznana", message.lower())
+        self.assertIn("download", message)
+        self.assertNotIn("invalid choice", message)
+
+    def test_literowka_w_opcji(self):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            with self.assertRaises(SystemExit):
+                cli.build_parser().parse_args(["build", "--outt", "a.xlsx"])
+        message = err.getvalue()
+        self.assertIn("nierozpoznany", message.lower())
+        self.assertNotIn("unrecognized arguments", message)
+
+    def test_version_dziala_w_kazdej_podkomendzie(self):
+        for argv in (["--version"], ["build", "--version"],
+                     ["download", "--version"], ["all", "--version"]):
+            with self.subTest(argv=argv):
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    with self.assertRaises(SystemExit) as ctx:
+                        cli.build_parser().parse_args(argv)
+                self.assertEqual(ctx.exception.code, 0)
+                self.assertIn(cli.PROG, out.getvalue())
 
 
 if __name__ == "__main__":  # pragma: no cover
